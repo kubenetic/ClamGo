@@ -1,0 +1,68 @@
+clamd:
+  unix:
+    path: /tmp/clamav/clamd/clamd.sock
+    readTimeout: 5s
+    writeTimeout: 5s
+
+rabbitmq:
+  enabled: true
+
+  channels:
+    input:
+      exchange: scan.jobs.x
+      queue: scan.jobs.q
+      routingKey: jobs
+
+    event:
+      exchange: scan.events.x
+      queue: scan.events.q
+      routingKey: events
+
+    output:
+      exchange: scan.results.x
+      queue: scan.results.q
+      routingKey: results
+
+    scrapyard:
+      exchange: scan.dead.x
+      queue: scan.dead.q
+      routingKey: dead
+
+    retry:
+      exchange: scan.retry.x
+      queues:
+        - name: scan.retry.30s.q
+          routingKey: 30s
+        - name: scan.retry.1m.q
+          routingKey: 1m
+        - name: scan.retry.2m.q
+          routingKey: 2m
+
+  consumer:
+    prefetchCount: 1
+    requeueOnFail: true
+
+  publisher:
+    confirmTimeout: 5s
+
+application:
+  logging:
+    level: debug
+
+  workerPool:
+    size: 3
+    queueSize: 100
+
+  server:
+    host: 127.0.0.1
+    port: 5050
+    readTimeout: 10s
+    writeTimeout: 10s
+    shutdownTimeout: 60s
+
+    tls:
+      enabled: false
+      key: /path/to/key
+      cert: /path/to/cert
+      ca: /path/to/ca
+      skipVerify: false

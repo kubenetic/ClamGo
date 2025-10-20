@@ -1,0 +1,9 @@
+POST http://localhost:5050/scan
+Content-Type: application/json
+
+{
+  "paths": [
+    "/scandir/textfile",
+    "/scandir/eicar.txt"
+  ]
+}
