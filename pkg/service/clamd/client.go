@@ -4,12 +4,13 @@
 package clamd
 
 import (
-    "ClamGo/pkg/model"
-    "bufio"
-    "fmt"
-    "net"
+	"bufio"
+	"fmt"
+	"net"
 
-    "github.com/rs/zerolog/log"
+	"ClamGo/pkg/model"
+
+	"github.com/rs/zerolog/log"
 )
 
 // ClamClient wraps a network connection to clamd and provides convenience methods
@@ -21,68 +22,68 @@ type ClamClient struct {
 // NewClient returns a new ClamClient that uses the provided net.Conn.
 // The caller is responsible for establishing and closing the connection.
 func NewClient() *ClamClient {
-    return &ClamClient{}
+	return &ClamClient{}
 }
 
 // Close closes the underlying network connection to clamd.
 func (client *ClamClient) Close() error {
-    return nil
+	return nil
 }
 
 // write sends raw bytes to the clamd connection and logs the number of bytes written.
 // It returns any error encountered while writing.
 func (client *ClamClient) write(connection net.Conn, command []byte) error {
-    bytesWritten, err := connection.Write(command)
-    if err != nil {
-        return err
-    }
+	bytesWritten, err := connection.Write(command)
+	if err != nil {
+		return err
+	}
 
-    log.Debug().
-        Int("bytes written", bytesWritten).
-        Str("command", string(command)).
-        Msg("command sent")
+	log.Debug().
+		Int("bytes written", bytesWritten).
+		Str("command", string(command)).
+		Msg("command sent")
 
-    return nil
+	return nil
 }
 
 // sendCommand formats and sends a clamd command using the required framing:
 // it prefixes the command with 'n' and appends a newline ("n<COMMAND>\n").
 // Returns any error encountered while writing to the connection.
 func (client *ClamClient) sendCommand(connection net.Conn, command model.ClamDCommand) error {
-    wrappedCommand := fmt.Sprintf("n%s\n", command)
+	wrappedCommand := fmt.Sprintf("n%s\n", command)
 
-    if err := client.write(connection, []byte(wrappedCommand)); err != nil {
-        return err
-    }
+	if err := client.write(connection, []byte(wrappedCommand)); err != nil {
+		return err
+	}
 
-    return nil
+	return nil
 }
 
 // read reads from the clamd connection in chunks until no more data is available
 // or an EOF is encountered. It aggregates all received bytes into a single
 // slice and returns it. Logging includes the total number of bytes received.
 func (client *ClamClient) read(connection net.Conn) (response []byte, err error) {
-    reader := bufio.NewReader(connection)
-    response, err = reader.ReadBytes('\n')
-    if err != nil {
-        return nil, err
-    }
+	reader := bufio.NewReader(connection)
+	response, err = reader.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
 
-    log.Debug().
-        Int("received", len(response)).
-        Msg("response received")
+	log.Debug().
+		Int("received", len(response)).
+		Msg("response received")
 
-    return
+	return
 }
 
 func (client *ClamClient) sendAndReceive(connection net.Conn, command model.ClamDCommand) (response []byte, err error) {
-    if err = client.sendCommand(connection, command); err != nil {
-        return
-    }
+	if err = client.sendCommand(connection, command); err != nil {
+		return
+	}
 
-    if response, err = client.read(connection); err != nil {
-        return
-    }
+	if response, err = client.read(connection); err != nil {
+		return
+	}
 
-    return
+	return
 }
