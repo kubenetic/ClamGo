@@ -58,7 +58,7 @@ func (client *ClamClient) Scan(files ...string) (map[string]string, error) {
 
 		scanCmd := fmt.Sprintf("n%s %s\n", model.CmdScan, file)
 		if err := client.write(connection, []byte(scanCmd)); err != nil {
-			return nil, fmt.Errorf("error sending scan command to check file '%s': %w\n", err, file)
+			return nil, fmt.Errorf("error sending scan command to check file '%s': %w\n", file, err)
 		}
 
 		response, err := client.read(connection)
