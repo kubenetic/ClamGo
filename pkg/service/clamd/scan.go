@@ -2,15 +2,11 @@ package clamd
 
 import (
 	"fmt"
-	"net"
 	"path"
 	"regexp"
 	"strings"
 
 	"ClamGo/pkg/model"
-
-	"github.com/rs/zerolog/log"
-	"github.com/spf13/viper"
 )
 
 // parseScanResponse parses clamd scan text and returns a map[path]status where status is
@@ -39,14 +35,11 @@ func parseScanResponse(line string) map[string]string {
 }
 
 func (client *ClamClient) Scan(files ...string) (map[string]string, error) {
-	connection, err := net.Dial("unix", viper.GetString("clamd.unix.path"))
-	if err != nil {
-		log.Error().Err(err).Msg("error connecting to clamd")
+	if client.connection == nil {
+		return nil, fmt.Errorf("connection is nil")
 	}
 
-	defer connection.Close()
-
-	if err := client.sendCommand(connection, model.CmdStartSession); err != nil {
+	if err := client.sendCommand(model.CmdStartSession); err != nil {
 		return nil, fmt.Errorf("error starting session: %w\n", err)
 	}
 
@@ -57,11 +50,11 @@ func (client *ClamClient) Scan(files ...string) (map[string]string, error) {
 		}
 
 		scanCmd := fmt.Sprintf("n%s %s\n", model.CmdScan, file)
-		if err := client.write(connection, []byte(scanCmd)); err != nil {
+		if err := client.write([]byte(scanCmd)); err != nil {
 			return nil, fmt.Errorf("error sending scan command to check file '%s': %w\n", file, err)
 		}
 
-		response, err := client.read(connection)
+		response, err := client.read()
 		if err != nil {
 			return nil, fmt.Errorf("error reading response from clamd: %w\n", err)
 		}
@@ -72,7 +65,7 @@ func (client *ClamClient) Scan(files ...string) (map[string]string, error) {
 		}
 	}
 
-	if err := client.sendCommand(connection, model.CmdEndSession); err != nil {
+	if err := client.sendCommand(model.CmdEndSession); err != nil {
 		return nil, fmt.Errorf("error stopping session: %w", err)
 	}
 

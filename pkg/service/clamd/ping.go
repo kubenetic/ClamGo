@@ -1,21 +1,15 @@
 package clamd
 
 import (
-	"net"
+	"fmt"
 
 	"ClamGo/pkg/model"
-
-	"github.com/rs/zerolog/log"
-	"github.com/spf13/viper"
 )
 
 func (client *ClamClient) Ping() (response []byte, err error) {
-	connection, err := net.Dial("unix", viper.GetString("clamd.unix.path"))
-	if err != nil {
-		log.Error().Err(err).Msg("error connecting to clamd")
+	if client.connection == nil {
+		return nil, fmt.Errorf("connection is nil")
 	}
 
-	defer connection.Close()
-
-	return client.sendAndReceive(connection, model.CmdPing)
+	return client.sendAndReceive(model.CmdPing)
 }
