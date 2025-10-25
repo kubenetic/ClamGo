@@ -7,14 +7,17 @@ import (
 type ScanEventType string
 
 const (
-    ScanEventScanStarted        ScanEventType = "scan_started"
-    ScanEventScanFinished                     = "scan_finished"
-    ScanEventFileUploadStarted                = "file_upload_started"
-    ScanEventFileUploadFinished               = "file_upload_finished"
-    ScanEventPersisting                       = "persisting"
-    ScanEventPersisted                        = "persisted"
-    ScanEventFoundVirus                       = "found_virus"
-    ScanEventUnknown                          = "??"
+	ScanEventScanStarted            ScanEventType = "scan_started"
+	ScanEventScanFinished                         = "scan_finished"
+	ScanEventFileScanStarted                      = "file_scan_started"
+	ScanEventFileScanFinished                     = "file_scan_finished"
+	ScanEventFileScanFailed                       = "file_scan_failed"
+	ScanEventFileMaxAttemptsReached               = "file_max_attempts_reached"
+	ScanEventFileUploadStarted                    = "file_upload_started"
+	ScanEventFileUploadFinished                   = "file_upload_finished"
+	ScanEventPersisting                           = "persisting"
+	ScanEventPersisted                            = "persisted"
+	ScanEventUnknown                              = "??"
 )
 
 type ScanEventFileMetadata struct {
