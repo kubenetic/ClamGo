@@ -8,7 +8,7 @@ import (
 
 func (client *ClamClient) Version() (response []byte, err error) {
 	if client.connection == nil {
-		return nil, fmt.Errorf("connection is nil")
+		return nil, fmt.Errorf("mqConn is nil")
 	}
 
 	return client.sendAndReceive(model.CmdVersion)
