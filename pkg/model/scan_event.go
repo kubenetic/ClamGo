@@ -1,7 +1,7 @@
 package model
 
 import (
-    "time"
+	"time"
 )
 
 type ScanEventType string
@@ -20,15 +20,34 @@ const (
 	ScanEventUnknown                              = "??"
 )
 
+type FileStats interface {
+	GetFileId() string
+	GetFileName() string
+	GetSha256() string
+}
+
 type ScanEventFileMetadata struct {
-    FileId   string `json:"file_id"`
-    FileName string `json:"file_name"`
-    Sha256   string `json:"sha256"`
+	FileId   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	Sha256   string `json:"sha256"`
+}
+
+func (f *ScanEventFileMetadata) GetFileId() string {
+	return f.FileId
+}
+
+func (f *ScanEventFileMetadata) GetFileName() string {
+	return f.FileName
+}
+
+func (f *ScanEventFileMetadata) GetSha256() string {
+	return f.Sha256
 }
 
 type ScanEvent struct {
-    JobId     string                `json:"job_id"`
-    Timestamp time.Time             `json:"timestamp"`
-    File      ScanEventFileMetadata `json:"file"`
-    Status    ScanEventType         `json:"status"`
+	JobId     string                `json:"job_id"`
+	Timestamp time.Time             `json:"timestamp"`
+	File      ScanEventFileMetadata `json:"file"`
+	Status    ScanEventType         `json:"status"`
+	Error     string                `json:"error,omitempty"`
 }
