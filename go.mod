@@ -2,8 +2,6 @@ module ClamGo
 
 go 1.25.3
 
-toolchain go1.25.3
-
 require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/rs/zerolog v1.34.0
