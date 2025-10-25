@@ -10,7 +10,7 @@ import (
 
 func (client *ClamClient) Stats() (*model.ClamMetrics, error) {
 	if client.connection == nil {
-		return nil, fmt.Errorf("connection is nil")
+		return nil, fmt.Errorf("mqConn is nil")
 	}
 
 	response, err := client.sendAndReceive(model.CmdStats)
