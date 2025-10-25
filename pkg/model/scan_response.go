@@ -14,6 +14,18 @@ type ResponseFileMeta struct {
 	Elapsed   int64  `json:"elapsed"`
 }
 
+func (f *ResponseFileMeta) GetFileId() string {
+	return f.FileId
+}
+
+func (f *ResponseFileMeta) GetFileName() string {
+	return f.Name
+}
+
+func (f *ResponseFileMeta) GetSha256() string {
+	return f.Sha256
+}
+
 type ScanResponse struct {
 	JobId     string             `json:"job_id"`
 	Timestamp time.Time          `json:"timestamp"`
