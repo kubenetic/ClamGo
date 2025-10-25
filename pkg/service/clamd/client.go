@@ -11,22 +11,41 @@ import (
 	"ClamGo/pkg/model"
 
 	"github.com/rs/zerolog/log"
+	"github.com/spf13/viper"
 )
 
-// ClamClient wraps a network connection to clamd and provides convenience methods
-// to send commands and read responses. The client does not manage a connection
+// ClamClient wraps a network mqConn to clamd and provides convenience methods
+// to send commands and read responses. The client does not manage a mqConn
 // establishment; callers must supply a ready net.Conn.
 type ClamClient struct {
 	connection net.Conn
 }
 
-// NewClient returns a new ClamClient that uses the provided net.Conn.
-// The caller is responsible for establishing and closing the connection.
-func NewClient() *ClamClient {
-	return &ClamClient{}
+// NewClamClient returns a new ClamClient that uses the provided net.Conn.
+// The caller is responsible for establishing and closing the mqConn.
+func NewClamClient() (*ClamClient, error) {
+	client := &ClamClient{}
+	if viper.IsSet("clamd.unix") {
+		err := client.Connect("unix", viper.GetString("clamd.unix.path"))
+		return client, err
+	} else if viper.IsSet("clamd.tcp") {
+		err := client.Connect("tcp", viper.GetString("clamd.tcp.addr"))
+		return client, err
+	} else {
+		return nil, fmt.Errorf("no connection configuration found")
+	}
 }
 
-// Close closes the underlying network connection to clamd.
+func (client *ClamClient) Connect(proto string, addr string) error {
+	conn, err := net.Dial(proto, addr)
+	if err != nil {
+		return err
+	}
+	client.connection = conn
+	return nil
+}
+
+// Close closes the underlying network mqConn to clamd.
 func (client *ClamClient) Close() error {
 	if err := client.connection.Close(); err != nil {
 		return err
