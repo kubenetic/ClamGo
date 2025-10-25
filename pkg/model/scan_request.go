@@ -22,3 +22,11 @@ type ScanRequest struct {
 func (r *ScanRequest) IncrementAttempts() {
     r.Attempts++
 }
+
+func (r *ScanRequest) GetFilePaths() []string {
+	paths := make([]string, len(r.Files))
+	for i, f := range r.Files {
+		paths[i] = f.Path
+	}
+	return paths
+}
