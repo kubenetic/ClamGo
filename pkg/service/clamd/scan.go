@@ -9,10 +9,12 @@ import (
 	"ClamGo/pkg/model"
 )
 
+var ErrFileNotFound = fmt.Errorf("file not found")
+
 // parseScanResponse parses clamd scan text and returns a map[path]status where status is
 // either "OK" or the malware name without the trailing "FOUND". It ignores leading
 // numbering prefixes like "1:".
-func parseScanResponse(line string) map[string]string {
+func parseScanResponse(line string) string {
 	// Pattern matches optional leading number+colon, then a path, then colon and status
 	// Examples:
 	// 1: /scandir/vis.dwg: OK
@@ -20,54 +22,41 @@ func parseScanResponse(line string) map[string]string {
 	re := regexp.MustCompile(`^(?:\s*\d+:\s*)?([^:]+):\s*(.+?)\s*(?:FOUND)?\s*$`)
 
 	if strings.TrimSpace(line) == "" {
-		return nil
+		return ""
 	}
 
-	var result = make(map[string]string)
 	m := re.FindStringSubmatch(line)
 	if len(m) == 3 {
-		file := strings.TrimSpace(m[1])
-		status := strings.TrimSpace(m[2])
-		result[file] = status
+		return strings.TrimSpace(m[2])
 	}
 
-	return result
+	return ""
 }
 
-func (client *ClamClient) Scan(files ...string) (map[string]string, error) {
+func (client *ClamClient) ScanFile(filePath string) (string, error) {
 	if client.connection == nil {
-		return nil, fmt.Errorf("connection is nil")
+		return "", fmt.Errorf("mqConn is nil")
 	}
 
-	if err := client.sendCommand(model.CmdStartSession); err != nil {
-		return nil, fmt.Errorf("error starting session: %w\n", err)
+	if !path.IsAbs(filePath) {
+		return "", fmt.Errorf("file path (%s) must be absolute\n", filePath)
 	}
 
-	var result = make(map[string]string)
-	for _, file := range files {
-		if !path.IsAbs(file) {
-			return nil, fmt.Errorf("file path (%s) must be absolute\n", file)
-		}
-
-		scanCmd := fmt.Sprintf("n%s %s\n", model.CmdScan, file)
-		if err := client.write([]byte(scanCmd)); err != nil {
-			return nil, fmt.Errorf("error sending scan command to check file '%s': %w\n", file, err)
-		}
-
-		response, err := client.read()
-		if err != nil {
-			return nil, fmt.Errorf("error reading response from clamd: %w\n", err)
-		}
-
-		parsed := parseScanResponse(string(response))
-		for k, v := range parsed {
-			result[k] = v
-		}
+	scanCmd := fmt.Sprintf("n%s %s\n", model.CmdScan, filePath)
+	if err := client.write([]byte(scanCmd)); err != nil {
+		return "", fmt.Errorf("error sending scan command to check file '%s': %w\n", filePath, err)
 	}
 
-	if err := client.sendCommand(model.CmdEndSession); err != nil {
-		return nil, fmt.Errorf("error stopping session: %w", err)
+	response, err := client.read()
+	if err != nil {
+		return "", fmt.Errorf("error reading response from clamd: %w\n", err)
 	}
 
-	return result, nil
+	finding := parseScanResponse(string(response))
+
+	if finding == "File path check failure: No such file or directory. ERROR" {
+		return "", ErrFileNotFound
+	}
+
+	return finding, nil
 }
