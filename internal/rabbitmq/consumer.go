@@ -21,13 +21,13 @@ type MessageHandler func(ctx context.Context, message amqp.Delivery) *ConsumeErr
 type Consumer struct {
 	cm *ConnectionManager
 
-	conCh                     *amqp.Channel
-	consumerReconnectAttempts int
-	conMu                     sync.Mutex
+	conCh *amqp.Channel
+	cra   int // consumer reinit attempts
+	conMu sync.Mutex
 
-	pubCh                      *amqp.Channel
-	publisherReconnectAttempts int
-	pubMu                      sync.Mutex
+	pubCh *amqp.Channel
+	pra   int // publisher reinit attempts
+	pubMu sync.Mutex
 }
 
 func NewConsumer(cm *ConnectionManager) (*Consumer, error) {
@@ -55,9 +55,9 @@ func (c *Consumer) initConsumerChannel() error {
 	}
 
 	c.conCh = ch
-	c.consumerReconnectAttempts = 1
+	c.cra = 1
 
-	if c.consumerReconnectAttempts > 1 {
+	if c.cra > 1 {
 		log.Debug().Msg("consumer channel reinitialized")
 	} else {
 		log.Debug().Msg("consumer channel initialized")
@@ -78,9 +78,9 @@ func (c *Consumer) initPublisherChannel() error {
 	}
 
 	c.pubCh = ch
-	c.publisherReconnectAttempts = 1
+	c.pra = 1
 
-	if c.publisherReconnectAttempts > 1 {
+	if c.pra > 1 {
 		log.Debug().Msg("publisher channel reinitialized")
 	} else {
 		log.Debug().Msg("publisher channel initialized")
