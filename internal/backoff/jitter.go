@@ -1,4 +1,4 @@
-package rabbitmq
+package backoff
 
 import (
     "math/rand"
@@ -13,7 +13,7 @@ var (
 
 // jitter adds a small random component (up to 25% of d) to the provided
 // duration. It is safe for concurrent use.
-func jitter(d time.Duration) time.Duration {
+func Jitter(d time.Duration) time.Duration {
     rngMu.Lock()
     n := rng.Int63n(int64(d/4) + 1)
     rngMu.Unlock()
