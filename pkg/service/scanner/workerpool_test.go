@@ -3,6 +3,7 @@ package scanner
 import (
     "context"
     "encoding/json"
+    "errors"
     "fmt"
     "os"
     "os/signal"
@@ -69,10 +70,12 @@ func Test_Run(t *testing.T) {
         workerCount     = 3
     )
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
+    baseCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+    defer stop()
 
-    signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+    // Test timeout guard to avoid hanging CI
+    ctx, cancel := context.WithTimeout(baseCtx, 90*time.Second)
+    defer cancel()
 
     clamCntr, err := startClamD(ctx, clamdVersion)
     if err != nil {
@@ -97,13 +100,6 @@ func Test_Run(t *testing.T) {
     rabbitPort, _ := mqCtnr.MappedPort(ctx, "5672/tcp")
     mqAddr := fmt.Sprintf("amqp://guest:guest@%s:%s/", rabbitHost, rabbitPort.Port())
 
-    rabbitConn, err := amqp091.Dial(mqAddr)
-    if err != nil {
-        t.Fatal(err)
-    }
-    defer rabbitConn.Close()
-    log.Info().Msg("RabbitMQ connection established")
-
     mqCm, err := rabbitmq.NewConnectionManager(ctx, mqAddr, nil)
     if err != nil {
         t.Fatal(err)
@@ -111,143 +107,216 @@ func Test_Run(t *testing.T) {
     defer mqCm.Close()
     log.Info().Msg("RabbitMQ connection manager established")
 
-    wp := WorkerPool{
-        mqConn: mqCm,
-    }
+    // Declare topology
+    initMQ(t, mqAddr)
 
-    initMQ(t, rabbitConn)
-
+    // Start worker pool
+    wp := WorkerPool{mqConn: mqCm}
     errCh := wp.Run(ctx, workerCount)
     go func() {
         for err := range errCh {
+            if err == nil {
+                continue
+            }
+            if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+                // ignore expected shutdown errors
+                continue
+            }
             t.Error(err)
         }
     }()
     log.Info().Msg("WorkerPool started")
 
+    // Set up result and event collectors
+    eventsCh := make(chan model.ScanEvent, 16)
+    resultsCh := make(chan model.ScanResponse, 4)
+
+    // Start consumers BEFORE publishing
+    eventsConsumer, err := rabbitmq.NewConsumer(mqCm)
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer eventsConsumer.Close()
+
+    go func() {
+        if err := eventsConsumer.Subscribe(ctx, "scan.events.q", "", func(c context.Context, message amqp091.Delivery) error {
+            defer func() {
+                _ = message.Ack(false)
+            }()
+
+            var evt model.ScanEvent
+            if err := json.Unmarshal(message.Body, &evt); err != nil {
+                return err
+            }
+            log.Info().
+                Str("queue", "scan.events.q").
+                Str("jobId", evt.JobId).
+                Str("status", string(evt.Status)).
+                Str("file", evt.File.FileName).
+                Msg("event received")
+
+            select {
+            case eventsCh <- evt:
+            default:
+                // drop if buffer full
+            }
+
+            return nil
+        }); err != nil {
+            // Surface subscription errors into the test, ignore expected context cancellations
+            if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+                t.Error(err)
+            }
+        }
+    }()
+
+    resultsConsumer, err := rabbitmq.NewConsumer(mqCm)
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer resultsConsumer.Close()
+
+    go func() {
+        if err := resultsConsumer.Subscribe(ctx, "scan.results.q", "", func(c context.Context, message amqp091.Delivery) error {
+            defer func() {
+                _ = message.Ack(false)
+            }()
+
+            var resp model.ScanResponse
+            if err := json.Unmarshal(message.Body, &resp); err != nil {
+                return err
+            }
+            log.Info().
+                Str("queue", "scan.results.q").
+                Str("jobId", resp.JobId).
+                Int("files", len(resp.Files)).
+                Msg("result received")
+
+            select {
+            case resultsCh <- resp:
+            default:
+            }
+
+            return nil
+        }); err != nil {
+            if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+                t.Error(err)
+            }
+        }
+    }()
+
+    // Prepare and publish a scan request with two files
     scanReq := model.ScanRequest{
         JobId:     "1234",
         Attempts:  1,
         Timestamp: time.Now(),
         Files: []model.RequestFileMeta{
-            {
-                FileId: "a",
-                Name:   "eicar.txt",
-                Path:   "/testfiles/eicar.txt",
-            },
-            {
-                FileId: "b",
-                Name:   "http_request.http",
-                Path:   "/testfiles/scan_request.http",
-            },
+            {FileId: "a", Name: "eicar.txt", Path: "/testfiles/eicar.txt"},
+            {FileId: "b", Name: "http_request.http", Path: "/testfiles/scan_request.http"},
         },
     }
 
-    pubCh, err := rabbitConn.Channel()
+    publisher, err := rabbitmq.NewPublisher(mqCm)
     if err != nil {
         t.Fatal(err)
     }
-    defer pubCh.Close()
-    log.Info().Msg("RabbitMQ publish channel established")
+    defer publisher.Close()
+    log.Info().Msg("RabbitMQ publisher established")
 
-    scanReqJson, _ := json.Marshal(scanReq)
-    err = pubCh.Publish("scan.jobs.x", "jobs", false, false, amqp091.Publishing{
-        ContentType: "application/json",
-        Timestamp:   time.Now(),
-        Type:        "ScanRequest",
-        Body:        scanReqJson,
-    })
-    if err != nil {
+    if err := publisher.Publish(ctx, "scan.jobs.x", "jobs", false, &model.JSONMessage[model.ScanRequest]{
+        Payload:       scanReq,
+        MessageId:     "",
+        CorrelationId: "",
+        Headers:       nil,
+        ContentType:   "",
+    }); err != nil {
         t.Fatal(err)
     }
-    defer func() {
-        if err := pubCh.Close(); err != nil {
-            log.Error().Err(err).Msg("error closing publish channel")
-            t.Error(err)
-        }
-    }()
     log.Info().Msg("ScanRequest published")
 
-    conCh, err := rabbitConn.Channel()
-    if err != nil {
-        t.Fatal(err)
+    // Await expected events and results
+    type void struct{}
+    done := make(chan void)
+
+    // Expectations
+    expectedEvents := map[model.ScanEventType]int{
+        model.ScanEventScanStarted:      1,
+        model.ScanEventFileScanStarted:  2,
+        model.ScanEventFileScanFinished: 2,
+        model.ScanEventScanFinished:     1,
     }
-    defer func() {
-        if err := conCh.Close(); err != nil {
-            log.Error().Err(err).Msg("error closing consume channel")
-            t.Error(err)
+    receivedEvents := make(map[model.ScanEventType]int)
+    fileStart := map[string]bool{"a": false, "b": false}
+    fileFinish := map[string]bool{"a": false, "b": false}
+
+    verdicts := map[string]string{} // file name -> verdict
+
+    go func() {
+        for {
+            select {
+            case evt := <-eventsCh:
+                receivedEvents[evt.Status]++
+                switch evt.Status {
+                case model.ScanEventFileScanStarted:
+                    fileStart[evt.File.FileId] = true
+                case model.ScanEventFileScanFinished:
+                    fileFinish[evt.File.FileId] = true
+                }
+            case res := <-resultsCh:
+                for _, f := range res.Files {
+                    verdicts[f.Name] = f.Verdict
+                }
+            case <-ctx.Done():
+                close(done)
+                return
+            }
+
+            // Check if all expectations met
+            allEvents := true
+            for k, v := range expectedEvents {
+                if receivedEvents[k] < v {
+                    allEvents = false
+                    break
+                }
+            }
+            filesDone := fileStart["a"] && fileStart["b"] && fileFinish["a"] && fileFinish["b"]
+            twoVerdicts := len(verdicts) >= 2
+            if allEvents && filesDone && twoVerdicts {
+                close(done)
+                return
+            }
         }
     }()
-    log.Info().Msg("RabbitMQ consume channel established")
 
-    events, err := conCh.Consume("scan.events.q", "", true, false, false, false, nil)
-    if err != nil {
-        t.Fatal(err)
+    <-done
+
+    // Stop workers and consumers gracefully
+    cancel()
+    wp.Wait()
+
+    // Assertions
+    if got := receivedEvents[model.ScanEventScanStarted]; got != 1 {
+        t.Fatalf("expected 1 scan_started event, got %d", got)
     }
-    log.Info().Msg("event consumer started")
+    if got := receivedEvents[model.ScanEventScanFinished]; got != 1 {
+        t.Fatalf("expected 1 scan_finished event, got %d", got)
+    }
+    if got := receivedEvents[model.ScanEventFileScanStarted]; got < 2 {
+        t.Fatalf("expected 2 file_scan_started events, got %d", got)
+    }
+    if got := receivedEvents[model.ScanEventFileScanFinished]; got < 2 {
+        t.Fatalf("expected 2 file_scan_finished events, got %d", got)
+    }
+    if !fileStart["a"] || !fileStart["b"] || !fileFinish["a"] || !fileFinish["b"] {
+        t.Fatalf("expected per-file start/finish events for files a and b, got start=%v finish=%v", fileStart, fileFinish)
+    }
 
-    for {
-        log.Trace().Msg("waiting for events")
-
-        select {
-        case err, ok := <-errCh:
-            if !ok {
-                log.Error().Msg("error channel closed")
-                t.Error("error channel closed")
-                return
-            }
-
-            log.Error().Err(err).Msg("error received")
-            t.Error(err)
-            return
-
-        case <-ctx.Done():
-            log.Error().Msg("context cancelled")
-            t.Error(ctx.Err())
-            return
-
-        case evt, ok := <-events:
-            if !ok {
-                log.Error().Msg("message channel closed")
-                t.Error("message channel closed")
-                return
-            }
-
-            _ = evt.Ack(false)
-
-            var scanEvent model.ScanEvent
-            if err := json.Unmarshal(evt.Body, &scanEvent); err != nil {
-                log.Error().Err(err).Msg("error unmarshalling event")
-                t.Error(err)
-                return
-            }
-
-            if scanEvent.Status == model.ScanEventScanFinished {
-                log.Info().
-                    Str("jobID", scanEvent.JobId).
-                    Msg("scan finished successfully")
-                break
-            }
-
-            if scanEvent.Status == model.ScanEventFileScanFailed {
-                log.Warn().
-                    Str("jobID", scanEvent.JobId).
-                    Msg("scan failed")
-                break
-            }
-
-            if scanEvent.Status == model.ScanEventFileMaxAttemptsReached {
-                log.Warn().
-                    Str("jobID", scanEvent.JobId).
-                    Msg("max attempts reached")
-                break
-            }
-
-            log.Info().
-                Str("jobID", scanEvent.JobId).
-                Str("status", string(scanEvent.Status)).
-                Msg("event consumed")
-        }
+    // Result verdicts: eicar.txt FOUND, http_request.http OK
+    if v, ok := verdicts["eicar.txt"]; !ok || v != "FOUND" {
+        t.Fatalf("expected verdict for eicar.txt = FOUND, got %q (present=%v)", v, ok)
+    }
+    if v, ok := verdicts["http_request.http"]; !ok || v != "OK" {
+        t.Fatalf("expected verdict for http_request.http = OK, got %q (present=%v)", v, ok)
     }
 }
 
@@ -285,7 +354,14 @@ func startClamD(ctx context.Context, clamdVersion string) (*testcontainers.Docke
     return clamd, err
 }
 
-func initMQ(t *testing.T, rabbitConn *amqp091.Connection) {
+func initMQ(t *testing.T, mqAddr string) {
+    rabbitConn, err := amqp091.Dial(mqAddr)
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer rabbitConn.Close()
+    log.Info().Msg("RabbitMQ connection established")
+
     adminCh, err := rabbitConn.Channel()
     if err != nil {
         t.Fatal(err)
