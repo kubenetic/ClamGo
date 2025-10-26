@@ -7,6 +7,7 @@ import (
     "sync"
     "time"
 
+    "ClamGo/internal/backoff"
     "ClamGo/pkg/model"
 
     amqp "github.com/rabbitmq/amqp091-go"
@@ -19,6 +20,22 @@ import (
 // time-bounded by the publisher and should be respected by implementations.
 // Implementations should be fast and non-blocking.
 type ReturnHandler func(ctx context.Context, ret amqp.Return) error
+
+// PublisherConfig holds configuration for Publisher behavior.
+type PublisherConfig struct {
+    MaxRetries     int
+    InitialBackoff time.Duration
+    ConfirmTimeout time.Duration
+}
+
+// DefaultPublisherConfig returns sensible defaults.
+func DefaultPublisherConfig() PublisherConfig {
+    return PublisherConfig{
+        MaxRetries:     5,
+        InitialBackoff: 200 * time.Millisecond,
+        ConfirmTimeout: 5 * time.Second,
+    }
+}
 
 // Publisher is a simple publisher that uses a single channel with confirmations
 // and background goroutines to drain returns and observe channel closes.
@@ -34,17 +51,55 @@ type Publisher struct {
     closes  chan *amqp.Error
     mu      sync.Mutex
 
+    pra    int // publish reinit attempts
+    config PublisherConfig
     // Optional callback for handling unroutable messages. If nil, unroutable messages
     // will be logged on error level and discarded.
     OnReturn ReturnHandler
+}
+
+// PublisherOption defines a function that modifies the Publisher configuration.
+// Use it with NewPublisher to customize behavior.
+// Example:
+//   p, _ := NewPublisher(cm, WithMaxRetries(3))
+//   p2, _ := NewPublisher(cm, WithPublisherConfig(PublisherConfig{...}))
+// If no options are provided, DefaultPublisherConfig() is used.
+type PublisherOption func(*PublisherConfig)
+
+// WithPublisherConfig sets the entire Publisher configuration at once.
+func WithPublisherConfig(cfg PublisherConfig) PublisherOption {
+    return func(c *PublisherConfig) { *c = cfg }
+}
+
+// WithMaxRetries overrides the maximum number of retry attempts on publish.
+func WithMaxRetries(n int) PublisherOption {
+    return func(c *PublisherConfig) { c.MaxRetries = n }
+}
+
+// WithInitialBackoff sets the initial backoff delay for retries.
+func WithInitialBackoff(d time.Duration) PublisherOption {
+    return func(c *PublisherConfig) { c.InitialBackoff = d }
+}
+
+// WithConfirmTimeout sets the timeout waiting for publisher confirms.
+func WithConfirmTimeout(d time.Duration) PublisherOption {
+    return func(c *PublisherConfig) { c.ConfirmTimeout = d }
 }
 
 // NewPublisher constructs a Publisher bound to the given ConnectionManager and
 // eagerly initializes an AMQP channel with confirmations enabled. Background
 // goroutines are started to drain returned messages and observe channel close
 // events. Use Close to release resources.
-func NewPublisher(cm *ConnectionManager) (*Publisher, error) {
-    p := &Publisher{cm: cm}
+func NewPublisher(cm *ConnectionManager, opts ...PublisherOption) (*Publisher, error) {
+    // Start from defaults, then apply any provided options.
+    cfg := DefaultPublisherConfig()
+    for _, opt := range opts {
+        if opt != nil {
+            opt(&cfg)
+        }
+    }
+
+    p := &Publisher{cm: cm, config: cfg}
     if err := p.reinit(); err != nil {
         return nil, err
     }
@@ -79,7 +134,13 @@ func (p *Publisher) reinit() error {
     go p.handleReturns(p.returns)
     go p.handleClose(p.ch, p.closes)
 
-    log.Debug().Msg("publisher channel (re)initialized")
+    p.pra = p.pra + 1
+    if p.pra > 1 {
+        log.Debug().Msg("publisher channel (re)initialized")
+    } else {
+        log.Debug().Msg("publisher channel initialized")
+    }
+
     return nil
 }
 
@@ -158,11 +219,9 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
     ch := p.ch
     p.mu.Unlock()
 
-    // TODO: externalize these values to config
-    const maxRetries = 5
-    backoff := 200 * time.Millisecond
-
-    confirmTimeout := 5 * time.Second
+    maxRetries := p.config.MaxRetries
+    backoffTime := p.config.InitialBackoff
+    confirmTimeout := p.config.ConfirmTimeout
 
     var lastErr error
     for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -240,9 +299,9 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, ma
             log.Debug().Msg("publish cancelled by the caller")
             return ctx.Err()
 
-        case <-time.After(jitter(backoff)):
-            if backoff < 5*time.Second {
-                backoff *= 2
+        case <-time.After(backoff.Jitter(backoffTime)):
+            if backoffTime < 5*time.Second {
+                backoffTime *= 2
             }
         }
     }
