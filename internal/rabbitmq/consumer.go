@@ -196,7 +196,7 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 					defer func() {
 						if r := recover(); r != nil {
 							log.Error().Msg("panic in message handler")
-							// TODO: send to DLQ
+							_ = message.Nack(false, false)
 						}
 					}()
 
