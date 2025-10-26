@@ -150,7 +150,7 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 		}
 
 		messages, err := ch.ConsumeWithContext(
-			ctx, queue, consumer, true, false, false, false, nil)
+			ctx, queue, consumer, false, false, false, false, nil)
 		if err != nil {
 			log.Error().Err(err).Msg("error consuming messages")
 
