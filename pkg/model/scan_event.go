@@ -9,6 +9,7 @@ type ScanEventType string
 const (
 	ScanEventScanStarted            ScanEventType = "scan_started"
 	ScanEventScanFinished                         = "scan_finished"
+	ScanEventScanInterrupted                      = "scan_interrupted"
 	ScanEventFileScanStarted                      = "file_scan_started"
 	ScanEventFileScanFinished                     = "file_scan_finished"
 	ScanEventFileScanFailed                       = "file_scan_failed"
