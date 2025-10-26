@@ -4,16 +4,13 @@ import (
     "context"
     "errors"
     "fmt"
-    "os"
-    "strings"
+    "strconv"
     "sync"
-    "time"
 
     "ClamGo/internal/rabbitmq"
     "ClamGo/pkg/model"
     "ClamGo/pkg/service/clamd"
 
-    "github.com/rabbitmq/amqp091-go"
     "github.com/rs/zerolog/log"
 )
 
@@ -49,15 +46,6 @@ func nonBlockErr(err error, errCh chan<- error) {
     }
 }
 
-func genConsumerTag(wid int) string {
-    hostname, err := os.Hostname()
-    if err != nil {
-        hostname = "unknown"
-    }
-
-    return fmt.Sprintf("c-%s-%d-%d", hostname, wid, os.Getpid())
-}
-
 func (wp *WorkerPool) Run(ctx context.Context, workerCount int) <-chan error {
     log.Info().
         Int("workerCount", workerCount).
@@ -75,7 +63,9 @@ func (wp *WorkerPool) Run(ctx context.Context, workerCount int) <-chan error {
 
     for wid := 0; wid < workerCount; wid++ {
         wp.wg.Go(func() {
-            log.Debug().Int("worker", wid).Msg("starting worker")
+            log.Debug().
+                Int("worker", wid).
+                Msg("starting worker")
 
             // Create a new context for each worker
             wCtx, wCncl := context.WithCancel(ctx)
@@ -147,11 +137,15 @@ func (wp *WorkerPool) Run(ctx context.Context, workerCount int) <-chan error {
                 return nil
             }
 
-            err = consumer.Subscribe(wCtx, qScanJobs, genConsumerTag(wid), worker.handleScanCb)
+            err = consumer.Subscribe(wCtx, qScanJobs, rabbitmq.GenConsumerTag(strconv.Itoa(wid)), worker.handleScanCb)
             if err != nil {
                 nonBlockErr(fmt.Errorf("cannot subscribe to rabbitmq queue. %w", err), errCh)
                 return
             }
+
+            log.Debug().
+                Int("worker", wid).
+                Msg("worker stopped")
         })
     }
 
@@ -187,99 +181,4 @@ func handleClamdSession(jobId string, wid int, cb func(clamClient *clamd.ClamCli
     log.Trace().Int("worker", wid).Msg("opened session")
 
     return cb(clamClient)
-}
-
-func (w *Worker) handleScanCb(ctx context.Context, message amqp091.Delivery) *rabbitmq.ConsumeError {
-    log.Trace().Int("worker", w.id).Msg("received message")
-
-    req, err := decodeScanRequest(&message)
-    if err != nil {
-        return rabbitmq.NewConsumeError(fmt.Errorf("error decoding message: %w", err))
-    }
-
-    if len(req.Files) == 0 {
-        log.Warn().Int("worker", w.id).Msg("received scan request with no files")
-        if err := w.OnScanFailed(ctx, req.JobId, model.ScanEventFileScanFailed, model.RequestFileMeta{}, ErrEmptyScanJob); err != nil {
-            log.Error().Err(err).Int("worker", w.id).Msg("error emitting scan failed event")
-            return rabbitmq.NewConsumeError(fmt.Errorf("error emitting scan failed event: %w", err))
-        }
-
-        return rabbitmq.NewConsumeError(message.Nack(false, false))
-    }
-
-    if err := w.OnScanStarted(ctx, req.JobId); err != nil {
-        log.Error().
-            Err(err).
-            Str("jobId", req.JobId).
-            Int("worker", w.id).
-            Msg("error emitting scan started event")
-    }
-
-    log.Trace().Int("worker", w.id).Msg("decoded message")
-    scanStarted := time.Now()
-
-    scanResult, err := handleClamdSession(req.JobId, w.id, func(client *clamd.ClamClient) (*ScanResult, error) {
-        return w.scanFiles(ctx, client, req)
-    })
-
-    if err != nil {
-        if errors.Is(err, ErrMaxAttemptsReached) {
-            log.Warn().
-                Err(err).
-                Str("jobId", req.JobId).
-                Int("worker", w.id).
-                Msg("max attempts reached, put message to dead letter queue")
-
-            return rabbitmq.NewConsumeError(message.Nack(false, false))
-        }
-
-        if errors.Is(err, ErrScanRetry) {
-            if scanResult == nil || scanResult.Retry == nil {
-                return rabbitmq.NewConsumeError(fmt.Errorf("got retry error, retry payload is nil"))
-            }
-
-            if err := message.Ack(false); err != nil {
-                return rabbitmq.NewConsumeError(fmt.Errorf("error acking message: %w", err))
-            }
-
-            return nil
-        }
-
-        if strings.HasPrefix(err.Error(), "clamd: ") {
-            log.Error().
-                Err(err).
-                Str("jobId", req.JobId).
-                Int("worker", w.id).
-                Msg("error scanning files, republishing message")
-            return rabbitmq.NewConsumeError(err, rabbitmq.WithRepublish())
-        }
-
-        return rabbitmq.NewConsumeError(err)
-    }
-
-    scanResponse := scanResult.Response
-    scanResponse.Elapsed = time.Since(scanStarted).Milliseconds()
-    scanResponse.JobId = req.JobId
-    scanResponse.Timestamp = time.Now()
-
-    log.Trace().Int("worker", w.id).Msg("finished scanning files")
-
-    if err := w.OnPublishResults(ctx, req.JobId, scanResponse); err != nil {
-        return rabbitmq.NewConsumeError(fmt.Errorf("error publishing results: %w", err))
-    }
-
-    if err := message.Ack(false); err != nil {
-        return rabbitmq.NewConsumeError(fmt.Errorf("error acknowledging message: %w", err))
-    }
-    log.Trace().Int("worker", w.id).Msg("acknowledged message")
-
-    if err := w.OnScanFinished(ctx, req.JobId); err != nil {
-        log.Error().
-            Err(err).
-            Str("jobId", req.JobId).
-            Int("worker", w.id).
-            Msg("error emitting scan finish event")
-    }
-
-    return nil
 }
