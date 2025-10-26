@@ -11,7 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type MessageHandler func(ctx context.Context, message amqp.Delivery) error
+type MessageHandler func(ctx context.Context, message amqp.Delivery) *ConsumeError
 
 // Consumer is a placeholder for future consumer-related utilities
 // built on top of ConnectionManager. It will manage consumer channels,
@@ -188,8 +188,10 @@ func (c *Consumer) Subscribe(ctx context.Context, queue, consumer string, cb Mes
 
 					err := cb(cbCtx, message)
 
-					if err != nil {
-						c.republish(ctx, message)
+					if err != nil && err.Republish {
+						if err := c.republish(ctx, message); err != nil {
+							log.Error().Err(err).Msg("error republishing message")
+						}
 					}
 				}()
 			}
