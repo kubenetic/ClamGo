@@ -7,10 +7,10 @@ import (
     "strconv"
     "sync"
 
-    "ClamGo/internal/rabbitmq"
     "ClamGo/pkg/model"
     "ClamGo/pkg/service/clamd"
 
+    "github.com/kubenetic/BunnyShepherd/pkg/rabbitmq"
     "github.com/rs/zerolog/log"
 )
 

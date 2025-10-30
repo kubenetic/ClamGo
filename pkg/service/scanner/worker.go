@@ -8,10 +8,11 @@ import (
     "strings"
     "time"
 
-    "ClamGo/internal/rabbitmq"
     "ClamGo/pkg/model"
     "ClamGo/pkg/service/clamd"
 
+    mq_model "github.com/kubenetic/BunnyShepherd/pkg/model"
+    "github.com/kubenetic/BunnyShepherd/pkg/rabbitmq"
     amqp "github.com/rabbitmq/amqp091-go"
     "github.com/rs/zerolog/log"
 )
@@ -168,7 +169,7 @@ func (w *Worker) scanFiles(ctx context.Context, clamClient *clamd.ClamClient, re
 }
 
 func (w *Worker) emitScanEvent(ctx context.Context, evtType model.ScanEventType, jobId string, fileMeta model.ScanEventFileMetadata) error {
-    message := &model.JSONMessage[model.ScanEvent]{
+    message := &mq_model.JSONMessage[model.ScanEvent]{
         Payload: model.ScanEvent{
             JobId:     jobId,
             Timestamp: time.Now(),
@@ -199,7 +200,7 @@ func (w *Worker) emitScanFinishedEvent(ctx context.Context, jobId string) error 
 }
 
 func (w *Worker) emitScanFileFailedEvent(ctx context.Context, jobId string, fileMeta model.RequestFileMeta, evtType model.ScanEventType, cause error) error {
-    message := &model.JSONMessage[model.ScanEvent]{
+    message := &mq_model.JSONMessage[model.ScanEvent]{
         Payload: model.ScanEvent{
             JobId:     jobId,
             Timestamp: time.Now(),
@@ -215,7 +216,7 @@ func (w *Worker) emitScanFileFailedEvent(ctx context.Context, jobId string, file
 }
 
 func (w *Worker) publishResults(ctx context.Context, payload model.ScanResponse) error {
-    message := &model.JSONMessage[model.ScanResponse]{
+    message := &mq_model.JSONMessage[model.ScanResponse]{
         Payload:       payload,
         MessageId:     "",
         CorrelationId: "",
@@ -371,7 +372,7 @@ func (w *Worker) republish(ctx context.Context, originalMsg amqp.Delivery, retry
     headers["x-attempts"] = attempt + 1
 
     return w.publisher.Publish(
-        repubCtx, exchange, routingKey, false, &model.JSONMessage[model.ScanRequest]{
+        repubCtx, exchange, routingKey, false, &mq_model.JSONMessage[model.ScanRequest]{
             Payload:       retryReq,
             MessageId:     originalMsg.MessageId,
             CorrelationId: originalMsg.CorrelationId,

@@ -11,9 +11,10 @@ import (
     "testing"
     "time"
 
-    "ClamGo/internal/rabbitmq"
     "ClamGo/pkg/model"
 
+    mq_model "github.com/kubenetic/BunnyShepherd/pkg/model"
+    "github.com/kubenetic/BunnyShepherd/pkg/rabbitmq"
     "github.com/rabbitmq/amqp091-go"
     "github.com/rs/zerolog"
     "github.com/rs/zerolog/log"
@@ -192,7 +193,7 @@ func Test_Run(t *testing.T) {
     defer publisher.Close()
     log.Info().Msg("RabbitMQ publisher established")
 
-    if err := publisher.Publish(ctx, "scan.jobs.x", "jobs", false, &model.JSONMessage[model.ScanRequest]{
+    if err := publisher.Publish(ctx, "scan.jobs.x", "jobs", false, &mq_model.JSONMessage[model.ScanRequest]{
         Payload:       scanReq,
         MessageId:     "",
         CorrelationId: "",
