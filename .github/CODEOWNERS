@@ -1,0 +1,45 @@
+# Code Owners for ClamGo Project
+# 
+# This file defines who is responsible for reviewing changes to different parts of the codebase.
+# GitHub will automatically request reviews from these users/teams when PRs are submitted.
+
+# Global owners - required for all changes
+* @ClamGo/maintainers
+
+# API related changes
+/api/** @ClamGo/api-team @ClamGo/maintainers
+
+# Core application logic
+/pkg/** @ClamGo/core-team @ClamGo/maintainers
+/internal/** @ClamGo/core-team @ClamGo/maintainers
+
+# Command line interface
+/cmd/** @ClamGo/core-team @ClamGo/maintainers
+
+# Configuration files
+/configs/** @ClamGo/maintainers
+config* @ClamGo/maintainers
+
+# Build and deployment
+/build/** @ClamGo/devops @ClamGo/maintainers
+Dockerfile* @ClamGo/devops @ClamGo/maintainers
+
+# CI/CD workflows
+/.github/workflows/** @ClamGo/devops @ClamGo/maintainers
+/.github/dependabot.yml @ClamGo/devops @ClamGo/maintainers
+
+# Go dependencies
+go.mod @ClamGo/maintainers
+go.sum @ClamGo/maintainers
+
+# Documentation
+*.md @ClamGo/docs @ClamGo/maintainers
+/docs/** @ClamGo/docs @ClamGo/maintainers
+
+# Tests
+*_test.go @ClamGo/qa @ClamGo/maintainers
+/test/** @ClamGo/qa @ClamGo/maintainers
+
+# License and legal
+LICENSE @ClamGo/maintainers
+SECURITY.md @ClamGo/security @ClamGo/maintainers

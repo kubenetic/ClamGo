@@ -1,0 +1,139 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        go-version: ['1.25']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+          args: --timeout=10m --max-issues-per-linter=0
+
+      - name: Run tests with coverage
+        run: |
+          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+          go tool cover -func=coverage.out
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.out
+          flags: unittests
+          fail_ci_if_error: false
+
+      - name: Build binary (Linux AMD64)
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            -o bin/clamgo-linux-amd64 \
+            .
+
+      - name: Build binary (Linux ARM64)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
+            -ldflags="-X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            -o bin/clamgo-linux-arm64 \
+            .
+
+      - name: Build binary (Darwin AMD64)
+        run: |
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
+            -ldflags="-X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            -o bin/clamgo-darwin-amd64 \
+            .
+
+      - name: Build binary (Darwin ARM64)
+        run: |
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+            -ldflags="-X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            -o bin/clamgo-darwin-arm64 \
+            .
+
+      - name: Build binary (Windows AMD64)
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
+            -ldflags="-X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            -o bin/clamgo-windows-amd64.exe \
+            .
+
+      - name: Generate changelog
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: changelog
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --latest --no-exec
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: bin/clamgo-*
+          body: ${{ steps.changelog.outputs.content }}
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clamgo-binaries-${{ github.sha }}
+          path: bin/
+          retention-days: 30
+
+  notify-success:
+    name: Build Succeeded
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Mark build as successful
+        run: echo "✅ Build and tests completed successfully"
+
+  notify-failure:
+    name: Build Failed
+    needs: build
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Mark build as failed
+        run: |
+          echo "❌ Build failed"
+          exit 1
