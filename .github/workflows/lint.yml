@@ -3,11 +3,11 @@ name: Code Quality Checks
 on:
   push:
     branches:
-      - main
+      - master
       - develop
   pull_request:
     branches:
-      - main
+      - master
       - develop
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           cache: true
@@ -28,9 +28,9 @@ jobs:
       - name: Run gofmt
         run: |
           if ! gofmt -l . | grep -v vendor; then
-            echo "✅ Code formatting check passed"
+            echo "Code formatting check passed"
           else
-            echo "❌ Code needs formatting. Run 'gofmt -w .'"
+            echo "Code needs formatting. Run 'gofmt -w .'"
             exit 1
           fi
 
@@ -40,7 +40,7 @@ jobs:
       - name: Run staticcheck
         uses: dominikh/staticcheck-action@v1
         with:
-          version: "2024.1"
+          version: latest
 
       - name: Check for security issues
         uses: securego/gosec@master

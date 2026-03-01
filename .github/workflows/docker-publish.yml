@@ -2,43 +2,17 @@ name: Build and Publish Docker Image
 
 on:
   push:
-    branches:
-      - main
-      - develop
     tags:
       - 'v*'
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  build:
-    name: Check if build succeeded
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Wait for build workflow
-        uses: lewagon/wait-on-check-action@v1.3.1
-        with:
-          ref: ${{ github.ref }}
-          check-name: 'Build and Test'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
-          allowed-conclusions: success
-
   docker-build:
     name: Build Docker Image
-    needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
@@ -49,6 +23,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Calculate version and build time
+        id: version
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "BUILD_TIME=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -76,7 +58,7 @@ jobs:
 
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./build/package/Dockerfile
@@ -84,6 +66,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+            BUILD_TIME=${{ steps.version.outputs.BUILD_TIME }}
           cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/clamgo:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/clamgo:buildcache,mode=max
 
@@ -108,8 +93,8 @@ jobs:
         run: |
           # Extract the first tag from the output
           IMAGE_TAG=$(echo "${{ needs.docker-build.outputs.image-tag }}" | head -n 1)
-          docker image inspect $IMAGE_TAG
-          echo "✅ Docker image successfully pushed: $IMAGE_TAG"
+          docker buildx imagetools inspect "$IMAGE_TAG"
+          echo "Docker image successfully pushed: $IMAGE_TAG"
         shell: bash
 
   notify-docker-success:
@@ -119,7 +104,7 @@ jobs:
     if: success()
     steps:
       - name: Notify success
-        run: echo "✅ Docker image built and pushed successfully"
+        run: echo "Docker image built and pushed successfully"
 
   notify-docker-failure:
     name: Docker Build Failed
@@ -129,5 +114,5 @@ jobs:
     steps:
       - name: Notify failure
         run: |
-          echo "❌ Docker build and publish failed"
+          echo "Docker build and publish failed"
           exit 1

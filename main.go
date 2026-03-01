@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,6 +20,12 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/rs/zerolog/pkgerrors"
 	"github.com/spf13/viper"
+)
+
+// Version and BuildTime are set at build time via ldflags.
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
 )
 
 func init() {
@@ -60,6 +68,9 @@ func init() {
 
 	// Temp NFS
 	viper.SetDefault("tempNFS.prefix", "/mnt/temp-nfs/")
+
+	// Health server
+	viper.SetDefault("health.port", 8080)
 
 	// Logging
 	viper.SetDefault("logging.level", "info")
@@ -166,6 +177,27 @@ func main() {
 
 	scanQueue := viper.GetString("rabbitmq.scanQueue")
 	cancelQueue := viper.GetString("rabbitmq.cancelQueue")
+
+	// Start health check HTTP server.
+	healthPort := viper.GetInt("health.port")
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":    "ok",
+				"version":   Version,
+				"buildTime": BuildTime,
+			})
+		})
+
+		addr := fmt.Sprintf(":%d", healthPort)
+		log.Info().Str("addr", addr).Msg("starting health check server")
+		if err := http.ListenAndServe(addr, mux); err != nil && ctx.Err() == nil {
+			log.Error().Err(err).Msg("health check server failed")
+		}
+	}()
 
 	// Start case.cancelled consumer in background.
 	go func() {

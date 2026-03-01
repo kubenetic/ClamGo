@@ -37,5 +37,8 @@ tempNFS:
   # ClamGo rejects file paths that do not start with this prefix.
   prefix: "/mnt/temp-nfs/"
 
+health:
+  port: 8080
+
 logging:
   level: "info"

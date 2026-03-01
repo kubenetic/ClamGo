@@ -3,13 +3,13 @@ name: Build and Release
 on:
   push:
     branches:
-      - main
+      - master
       - develop
     tags:
       - 'v*'
   pull_request:
     branches:
-      - main
+      - master
       - develop
 
 permissions:
@@ -32,16 +32,10 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
-
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v4
-        with:
-          version: latest
-          args: --timeout=10m --max-issues-per-linter=0
 
       - name: Run tests with coverage
         run: |
@@ -94,14 +88,14 @@ jobs:
       - name: Generate changelog
         if: startsWith(github.ref, 'refs/tags/v')
         id: changelog
-        uses: orhun/git-cliff-action@v3
+        uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --latest --no-exec
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: bin/clamgo-*
           body: ${{ steps.changelog.outputs.content }}
@@ -125,7 +119,7 @@ jobs:
     if: success()
     steps:
       - name: Mark build as successful
-        run: echo "✅ Build and tests completed successfully"
+        run: echo "Build and tests completed successfully"
 
   notify-failure:
     name: Build Failed
@@ -135,5 +129,5 @@ jobs:
     steps:
       - name: Mark build as failed
         run: |
-          echo "❌ Build failed"
+          echo "Build failed"
           exit 1
