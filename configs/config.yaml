@@ -1,68 +1,41 @@
 clamd:
+  tcp:
+    addr: "localhost:3310"
   unix:
-    path: /tmp/clamav/clamd/clamd.sock
-    readTimeout: 5s
-    writeTimeout: 5s
+    path: ""
 
 rabbitmq:
-  enabled: true
+  host: "127.0.0.1"
+  port: 5672
+  username: ""
+  password: ""
 
-  channels:
-    input:
-      exchange: scan.jobs.x
-      queue: scan.jobs.q
-      routingKey: jobs
+  # Main exchange
+  exchange: "uploader.exchange"
 
-    event:
-      exchange: scan.events.x
-      queue: scan.events.q
-      routingKey: events
+  # Dead-letter exchange (receives permanently failed messages)
+  dlx: "uploader.dlx"
 
-    output:
-      exchange: scan.results.x
-      queue: scan.results.q
-      routingKey: results
+  # Queues
+  scanQueue: "q.file.scan"
+  cancelQueue: "q.case.cancelled"
 
-    scrapyard:
-      exchange: scan.dead.x
-      queue: scan.dead.q
-      routingKey: dead
+  # Routing keys for outbound publishes
+  scanCompletedRoutingKey: "file.scan.completed"
+  scanRetryingRoutingKey: "file.scan.retrying"
+  dlqRoutingKey: "file.scan.failed"
 
-    retry:
-      exchange: scan.retry.x
-      queues:
-        - name: scan.retry.30s.q
-          routingKey: 30s
-        - name: scan.retry.1m.q
-          routingKey: 1m
-        - name: scan.retry.2m.q
-          routingKey: 2m
+  # Consumer QoS
+  prefetchCount: 1
 
-  consumer:
-    prefetchCount: 1
-    requeueOnFail: true
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
 
-  publisher:
-    confirmTimeout: 5s
+tempNFS:
+  # ClamGo rejects file paths that do not start with this prefix.
+  prefix: "/mnt/temp-nfs/"
 
-application:
-  logging:
-    level: debug
-
-  workerPool:
-    size: 3
-    queueSize: 100
-
-  server:
-    host: 127.0.0.1
-    port: 5050
-    readTimeout: 10s
-    writeTimeout: 10s
-    shutdownTimeout: 60s
-
-    tls:
-      enabled: false
-      key: /path/to/key
-      cert: /path/to/cert
-      ca: /path/to/ca
-      skipVerify: false
+logging:
+  level: "info"
