@@ -4,7 +4,7 @@ type ClamdState string
 
 const (
 	StateValid   ClamdState = "VALID"
-	StateInvalid            = "INVALID"
-	StateExit               = "EXIT"
-	StateUnknown            = "??"
+	StateInvalid ClamdState = "INVALID"
+	StateExit    ClamdState = "EXIT"
+	StateUnknown ClamdState = "??"
 )

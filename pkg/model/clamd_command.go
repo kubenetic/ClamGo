@@ -4,9 +4,9 @@ type ClamDCommand string
 
 const (
 	CmdPing         ClamDCommand = "PING"
-	CmdVersion                   = "VERSION"
-	CmdStats                     = "STATS"
-	CmdScan                      = "SCAN"
-	CmdStartSession              = "IDSESSION"
-	CmdEndSession                = "END"
+	CmdVersion      ClamDCommand = "VERSION"
+	CmdStats        ClamDCommand = "STATS"
+	CmdScan         ClamDCommand = "SCAN"
+	CmdStartSession ClamDCommand = "IDSESSION"
+	CmdEndSession   ClamDCommand = "END"
 )

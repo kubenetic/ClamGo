@@ -39,17 +39,17 @@ func (client *ClamClient) ScanFile(filePath string) (string, error) {
 	}
 
 	if !path.IsAbs(filePath) {
-		return "", fmt.Errorf("file path (%s) must be absolute\n", filePath)
+		return "", fmt.Errorf("file path (%s) must be absolute", filePath)
 	}
 
 	scanCmd := fmt.Sprintf("n%s %s\n", model.CmdScan, filePath)
 	if err := client.write([]byte(scanCmd)); err != nil {
-		return "", fmt.Errorf("error sending scan command to check file '%s': %w\n", filePath, err)
+		return "", fmt.Errorf("error sending scan command to check file '%s': %w", filePath, err)
 	}
 
 	response, err := client.read()
 	if err != nil {
-		return "", fmt.Errorf("error reading response from clamd: %w\n", err)
+		return "", fmt.Errorf("error reading response from clamd: %w", err)
 	}
 
 	finding := parseScanResponse(string(response))
