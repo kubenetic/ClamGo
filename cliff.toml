@@ -45,7 +45,7 @@ trim = true
 
 # postprocessors
 postprocessors = [
-    { pattern = '\${{ ENV_VAR }}', replace = "---" },
+    { pattern = '\\\$\{\{ ENV_VAR \}\}', replace = "---" },
 ]
 
 [git]
