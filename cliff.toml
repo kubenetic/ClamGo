@@ -24,12 +24,12 @@ body = """
     {% for commit in commits
     | filter(attribute="scope")
     | sort(attribute="scope") %}
-        - {% if commit.breaking %}[**BREAKING**] {% endif %}**{{ commit.scope }}**: {{ commit.message }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ commit.links[0].href }}))
+        - {% if commit.breaking %}[**BREAKING**] {% endif %}**{{ commit.scope }}**: {{ commit.message }}{% if commit.links %} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ commit.links[0].href }})){% endif %}
     {%- endfor %}
     {% raw %}\n{% endraw %}\
     {%- for commit in commits %}
         {%- if not commit.scope %}
-        - {% if commit.breaking %}[**BREAKING**] {% endif %}{{ commit.message }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ commit.links[0].href }}))
+        - {% if commit.breaking %}[**BREAKING**] {% endif %}{{ commit.message }}{% if commit.links %} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ commit.links[0].href }})){% endif %}
         {% endif -%}
     {%- endfor %}
 {% endfor %}\n
