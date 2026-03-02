@@ -66,6 +66,12 @@ func init() {
 	viper.SetDefault("redis.password", "")
 	viper.SetDefault("redis.db", 0)
 
+	// Redis Cluster
+	viper.SetDefault("redis.cluster.enabled", true)
+	viper.SetDefault("redis.cluster.nodes", []string{"redis-0:6379", "redis-1:6379", "redis-2:6379"})
+	viper.SetDefault("redis.cluster.password", "")
+	viper.SetDefault("redis.cluster.maxRedirects", 10)
+
 	// Temp NFS
 	viper.SetDefault("tempNFS.prefix", "/mnt/temp-nfs/")
 
@@ -126,24 +132,51 @@ func main() {
 
 	// Initialize Redis client (optional: used for cancelled:{caseId} fast-check).
 	var redisClient redis.UniversalClient
-	redisAddr := viper.GetString("redis.addr")
-	if redisAddr != "" {
-		redisClient = redis.NewClient(&redis.Options{
-			Addr:     redisAddr,
-			Password: viper.GetString("redis.password"),
-			DB:       viper.GetInt("redis.db"),
-		})
 
+	clusterEnabled := viper.GetBool("redis.cluster.enabled")
+
+	if clusterEnabled {
+		// Cluster mode
+		nodes := viper.GetStringSlice("redis.cluster.nodes")
+		if len(nodes) > 0 {
+			redisClient = redis.NewClusterClient(&redis.ClusterOptions{
+				Addrs:        nodes,
+				Password:     viper.GetString("redis.cluster.password"),
+				MaxRedirects: viper.GetInt("redis.cluster.maxRedirects"),
+			})
+
+			log.Info().
+				Strs("nodes", nodes).
+				Msg("Redis Cluster mode enabled")
+		}
+	} else {
+		// Single node mode (backward compatibility)
+		redisAddr := viper.GetString("redis.addr")
+		if redisAddr != "" {
+			redisClient = redis.NewClient(&redis.Options{
+				Addr:     redisAddr,
+				Password: viper.GetString("redis.password"),
+				DB:       viper.GetInt("redis.db"),
+			})
+
+			log.Info().
+				Str("addr", redisAddr).
+				Msg("Redis single-node mode enabled")
+		}
+	}
+
+	// Ping test (same for both modes)
+	if redisClient != nil {
 		pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := redisClient.Ping(pingCtx).Err(); err != nil {
-			log.Warn().Err(err).Msg("Redis ping failed; cancellation Redis check will be disabled")
+			log.Warn().Err(err).Msg("Redis connection failed; cancellation Redis check will be disabled")
 			redisClient = nil
 		}
 		pingCancel()
 
 		if redisClient != nil {
 			defer redisClient.Close()
-			log.Info().Str("addr", redisAddr).Msg("Redis connected")
+			log.Info().Msg("Redis connected successfully")
 		}
 	}
 

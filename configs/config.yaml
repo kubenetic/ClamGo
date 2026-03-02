@@ -29,9 +29,20 @@ rabbitmq:
   prefetchCount: 1
 
 redis:
+  # Single node configuration (backward compatible, not used when cluster enabled)
   addr: "127.0.0.1:6379"
   password: ""
   db: 0
+  
+  # Cluster configuration (now supported for high availability)
+  cluster:
+    enabled: true
+    nodes:
+      - redis-0:6379
+      - redis-1:6379
+      - redis-2:6379
+    password: ""
+    maxRedirects: 10
 
 tempNFS:
   # ClamGo rejects file paths that do not start with this prefix.
