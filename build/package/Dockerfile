@@ -34,8 +34,7 @@ FROM alpine:latest
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
-    curl \
-    dumb-init
+    curl
 
 # Create app user
 RUN addgroup -g 1000 clamgo && adduser -D -u 1000 -G clamgo clamgo
@@ -62,11 +61,11 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Use dumb-init to handle signals properly
-ENTRYPOINT ["/sbin/dumb-init", "--"]
+# Use shell to handle signals properly
+ENTRYPOINT ["/bin/sh", "-c"]
 
 # Default command
-CMD ["./clamgo"]
+CMD ["exec ./clamgo"]
 
 # Labels for metadata
 LABEL org.opencontainers.image.title="ClamGo" \
