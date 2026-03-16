@@ -75,6 +75,9 @@ type Config struct {
 	// DLQRoutingKey is the routing key for the DLQ (file.scan.failed).
 	DLQRoutingKey string
 
+	// ScanStartedRoutingKey is the routing key for scan started notifications.
+	ScanStartedRoutingKey string
+
 	// ClamdTCPAddr is the clamd TCP address (e.g. "localhost:3310").
 	// If empty, unix socket is used.
 	ClamdTCPAddr string
@@ -213,6 +216,19 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		Str("caseId", msg.CaseId).
 		Int("retryCount", retryCount).
 		Logger()
+
+	// Publish file.scan.started notification (best effort — non-fatal on failure).
+	startedMsg := model.ScanStartedMessage{
+		FileId:       msg.FileId,
+		CaseId:       msg.CaseId,
+		OriginalName: msg.OriginalName,
+		SizeBytes:    msg.SizeBytes,
+		StartedAt:    time.Now().UTC(),
+	}
+	startedEnvelope := &mqmodel.JSONMessage[model.ScanStartedMessage]{Payload: startedMsg}
+	if err := s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanStartedRoutingKey, false, startedEnvelope); err != nil {
+		log.Warn().Err(err).Str("fileId", msg.FileId).Msg("failed to publish ScanStartedMessage (non-fatal)")
+	}
 
 	// Open the file.
 	f, err := os.Open(msg.TempPath)

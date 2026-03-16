@@ -81,3 +81,14 @@ type ScanFailedMessage struct {
 	OriginalMessage FileUploadedMessage `json:"originalMessage"`
 	FailedAt        time.Time           `json:"failedAt"`
 }
+
+// ScanStartedMessage is published to uploader.exchange with routing key
+// file.scan.started when ClamGo begins processing a file.
+// Consumed from q.scan.results by the Java Backend for SSE push.
+type ScanStartedMessage struct {
+	FileId       string    `json:"fileId"`
+	CaseId       string    `json:"caseId"`
+	OriginalName string    `json:"originalName"`
+	SizeBytes    int64     `json:"sizeBytes"`
+	StartedAt    time.Time `json:"startedAt"`
+}

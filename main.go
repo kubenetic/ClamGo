@@ -59,6 +59,7 @@ func init() {
 	viper.SetDefault("rabbitmq.scanCompletedRoutingKey", "file.scan.completed")
 	viper.SetDefault("rabbitmq.scanRetryingRoutingKey", "file.scan.retrying")
 	viper.SetDefault("rabbitmq.dlqRoutingKey", "file.scan.failed")
+	viper.SetDefault("rabbitmq.scanStartedRoutingKey", "file.scan.started")
 	viper.SetDefault("rabbitmq.prefetchCount", 1)
 
 	// Redis
@@ -188,6 +189,7 @@ func main() {
 		ScanCompletedRoutingKey: viper.GetString("rabbitmq.scanCompletedRoutingKey"),
 		ScanRetryingRoutingKey:  viper.GetString("rabbitmq.scanRetryingRoutingKey"),
 		DLQRoutingKey:           viper.GetString("rabbitmq.dlqRoutingKey"),
+		ScanStartedRoutingKey:   viper.GetString("rabbitmq.scanStartedRoutingKey"),
 		ClamdTCPAddr:            viper.GetString("clamd.tcp.addr"),
 		ClamdUnixPath:           viper.GetString("clamd.unix.path"),
 	}

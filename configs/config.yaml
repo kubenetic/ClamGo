@@ -24,6 +24,7 @@ rabbitmq:
   scanCompletedRoutingKey: "file.scan.completed"
   scanRetryingRoutingKey: "file.scan.retrying"
   dlqRoutingKey: "file.scan.failed"
+  scanStartedRoutingKey: "file.scan.started"
 
   # Consumer QoS
   prefetchCount: 1
