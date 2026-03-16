@@ -50,6 +50,43 @@
       },
       "additionalProperties": false
     },
+    "ScanStartedMessage": {
+      "type": "object",
+      "title": "ScanStartedMessage",
+      "description": "Outbound message indicating ClamGo has started scanning a file. Published to uploader.exchange with routing key file.scan.started. Emitted once per file on the first scan attempt only (not on retries), after the file is confirmed open.",
+      "required": ["fileId", "caseId", "originalName", "sizeBytes", "startedAt"],
+      "properties": {
+        "fileId": {
+          "type": "string",
+          "description": "Unique file identifier (UUID)",
+          "example": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        },
+        "caseId": {
+          "type": "string",
+          "description": "Case identifier linking multiple files",
+          "example": "c-2025-001234"
+        },
+        "originalName": {
+          "type": "string",
+          "description": "Original filename as uploaded by user",
+          "example": "document.pdf"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "format": "int64",
+          "description": "File size in bytes",
+          "minimum": 0,
+          "example": 2457600
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 UTC timestamp when scanning began",
+          "example": "2025-03-01T12:00:00.500Z"
+        }
+      },
+      "additionalProperties": false
+    },
     "MagicByteAnalysis": {
       "type": "object",
       "title": "MagicByteAnalysis",

@@ -7,6 +7,7 @@ This document defines all RabbitMQ message payloads used by ClamGo for inter-ser
 | Message Type | Queue | Exchange | Routing Key | Direction | Purpose |
 |---|---|---|---|---|---|
 | **FileUploadedMessage** | `q.file.scan` | `uploader.exchange` | (binding key) | Inbound | Trigger file scan |
+| **ScanStartedMessage** | (fanout) | `uploader.exchange` | `file.scan.started` | Outbound | Scan has begun (first attempt only) |
 | **ScanCompletedMessage** | (fanout) | `uploader.exchange` | `file.scan.completed` | Outbound | Successful scan result |
 | **ScanRetryingMessage** | (fanout) | `uploader.exchange` | `file.scan.retrying` | Outbound | Scan failed, retrying |
 | **ScanFailedMessage** | `scan.dead.q` | `uploader.dlx` | `file.scan.failed` | Outbound | Permanent scan failure |
@@ -14,7 +15,78 @@ This document defines all RabbitMQ message payloads used by ClamGo for inter-ser
 
 ---
 
-## 1. FileUploadedMessage (Inbound)
+## 1. ScanStartedMessage (Outbound)
+
+**Purpose**: Notifies the Java Backend that ClamGo has begun scanning a file (SSE push trigger)  
+**Exchange**: `uploader.exchange`  
+**Routing Key**: `file.scan.started`  
+**Published**: Once per file, on the **first** scan attempt only (not on retries), after the file is confirmed open  
+**Consumer**: Java Backend (SSE push to client)
+
+### JSON Schema
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "ScanStartedMessage",
+  "description": "Outbound message indicating ClamGo has started scanning a file",
+  "required": ["fileId", "caseId", "originalName", "sizeBytes", "startedAt"],
+  "properties": {
+    "fileId": {
+      "type": "string",
+      "description": "Unique file identifier (UUID)",
+      "example": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    },
+    "caseId": {
+      "type": "string",
+      "description": "Case identifier linking multiple files",
+      "example": "c-2025-001234"
+    },
+    "originalName": {
+      "type": "string",
+      "description": "Original filename as uploaded by user",
+      "example": "document.pdf"
+    },
+    "sizeBytes": {
+      "type": "integer",
+      "format": "int64",
+      "description": "File size in bytes",
+      "minimum": 0,
+      "example": 2457600
+    },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp when scanning began",
+      "example": "2025-03-01T12:00:00.500Z"
+    }
+  }
+}
+```
+
+### Example Payload
+
+```json
+{
+  "fileId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "caseId": "c-2025-001234",
+  "originalName": "report_2025.pdf",
+  "sizeBytes": 2457600,
+  "startedAt": "2025-03-01T12:00:00.500Z"
+}
+```
+
+### Processing Notes
+
+- **Publish Timing**: Published after `os.Open` succeeds, guaranteeing the file exists before the backend is notified
+- **Retry Guard**: Only published when `retryCount == 0`; retried deliveries do **not** re-emit this event
+- **Best Effort**: Publish failure is logged as a warning but does not abort the scan
+- **SSE Use**: The Java Backend uses this event to push a "scanning…" status to the client UI
+
+---
+
+## 2. FileUploadedMessage (Inbound)
 
 **Purpose**: Triggers a file scan in ClamGo  
 **Queue**: `q.file.scan`  
@@ -97,7 +169,7 @@ This document defines all RabbitMQ message payloads used by ClamGo for inter-ser
 
 ---
 
-## 2. ScanCompletedMessage (Outbound)
+## 3. ScanCompletedMessage (Outbound)
 
 **Purpose**: Reports successful file scan completion (clean or infected)  
 **Exchange**: `uploader.exchange`  
@@ -250,7 +322,7 @@ This document defines all RabbitMQ message payloads used by ClamGo for inter-ser
 
 ---
 
-## 3. ScanRetryingMessage (Outbound)
+## 4. ScanRetryingMessage (Outbound)
 
 **Purpose**: Notifies backend of scan failure and retry attempt  
 **Exchange**: `uploader.exchange`  
@@ -347,7 +419,7 @@ This document defines all RabbitMQ message payloads used by ClamGo for inter-ser
 
 ---
 
-## 4. ScanFailedMessage (Outbound)
+## 5. ScanFailedMessage (Outbound)
 
 **Purpose**: Reports permanent scan failure after all retries exhausted  
 **Exchange**: `uploader.dlx` (Dead Letter Exchange)  
@@ -488,7 +560,7 @@ This document defines all RabbitMQ message payloads used by ClamGo for inter-ser
 
 ---
 
-## 5. CaseCancelledMessage (Inbound)
+## 6. CaseCancelledMessage (Inbound)
 
 **Purpose**: Signals cancellation of a case and all related file scans  
 **Queue**: `q.case.cancelled`  
