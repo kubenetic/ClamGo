@@ -217,26 +217,29 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		Int("retryCount", retryCount).
 		Logger()
 
-	// Publish file.scan.started notification (best effort — non-fatal on failure).
-	startedMsg := model.ScanStartedMessage{
-		FileId:       msg.FileId,
-		CaseId:       msg.CaseId,
-		OriginalName: msg.OriginalName,
-		SizeBytes:    msg.SizeBytes,
-		StartedAt:    time.Now().UTC(),
-	}
-	startedEnvelope := &mqmodel.JSONMessage[model.ScanStartedMessage]{Payload: startedMsg}
-	if err := s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanStartedRoutingKey, false, startedEnvelope); err != nil {
-		log.Warn().Err(err).Str("fileId", msg.FileId).Msg("failed to publish ScanStartedMessage (non-fatal)")
-	}
-
 	// Open the file.
 	f, err := os.Open(msg.TempPath)
 	if err != nil {
-		log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("failed to open file for scanning")
-		return s.handleScanFailure(ctx, d, msg, retryCount, "FILE_NOT_FOUND", err.Error(), d.Headers)
+		log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("file not found or unreadable; discarding (ACK)")
+		_ = d.Ack(false)
+		return nil
 	}
 	defer f.Close()
+
+	// Publish file.scan.started notification only on the first attempt (best effort — non-fatal on failure).
+	if retryCount == 0 {
+		startedMsg := model.ScanStartedMessage{
+			FileId:       msg.FileId,
+			CaseId:       msg.CaseId,
+			OriginalName: msg.OriginalName,
+			SizeBytes:    msg.SizeBytes,
+			StartedAt:    time.Now().UTC(),
+		}
+		startedEnvelope := &mqmodel.JSONMessage[model.ScanStartedMessage]{Payload: startedMsg}
+		if err := s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanStartedRoutingKey, false, startedEnvelope); err != nil {
+			log.Warn().Err(err).Msg("failed to publish ScanStartedMessage (non-fatal)")
+		}
+	}
 
 	// Compute SHA-256 and magic bytes in one pass.
 	sha256hex, magicAnalysis, mimeErr := computeChecksumAndMagicBytes(f, msg.OriginalName, msg.ContentType)
@@ -273,8 +276,9 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	scanDuration := time.Since(start)
 	if err != nil {
 		if err == clamd.ErrFileNotFound {
-			log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("clamd could not find file")
-			return s.handleScanFailure(ctx, d, msg, retryCount, "FILE_NOT_FOUND", err.Error(), d.Headers)
+			log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("clamd could not find file; discarding (ACK)")
+			_ = d.Ack(false)
+			return nil
 		}
 		log.Error().Err(err).Msg("clamd scan error")
 		return s.handleScanFailure(ctx, d, msg, retryCount, "SCAN_ERROR", err.Error(), d.Headers)
