@@ -156,6 +156,12 @@ func (s *Scanner) HandleScanMessage(ctx context.Context, d amqp.Delivery) error 
 		return nil
 	}
 
+	// Normalize IDs to standard 36-char UUID format. Old tusd-token-hook versions
+	// sent tusd's upload.ID (32-char hex without hyphens) as fileId; messages
+	// already in the queue or in retry queues may still carry that format.
+	msg.FileId = model.NormalizeUUID(msg.FileId)
+	msg.CaseId = model.NormalizeUUID(msg.CaseId)
+
 	log := log.With().
 		Str("fileId", msg.FileId).
 		Str("caseId", msg.CaseId).

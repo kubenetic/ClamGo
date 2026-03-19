@@ -11,6 +11,17 @@ func NewMessageId() string {
 	return uuid.New().String()
 }
 
+// NormalizeUUID converts a 32-char hex string (e.g. from tusd's upload.ID) to
+// the standard 36-char hyphenated UUID format. If the input is already in
+// standard format or cannot be parsed, it is returned unchanged.
+func NormalizeUUID(s string) string {
+	parsed, err := uuid.Parse(s)
+	if err != nil {
+		return s
+	}
+	return parsed.String()
+}
+
 // Verdict represents the outcome of a ClamAV scan.
 type Verdict string
 
