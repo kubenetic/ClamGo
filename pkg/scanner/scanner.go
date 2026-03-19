@@ -235,7 +235,10 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 			SizeBytes:    msg.SizeBytes,
 			StartedAt:    time.Now().UTC(),
 		}
-		startedEnvelope := &mqmodel.JSONMessage[model.ScanStartedMessage]{Payload: startedMsg}
+		startedEnvelope := &mqmodel.JSONMessage[model.ScanStartedMessage]{
+			Payload: startedMsg,
+			Headers: amqp.Table{"__TypeId__": "FileScanStartedMessage"},
+		}
 		if err := s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanStartedRoutingKey, false, startedEnvelope); err != nil {
 			log.Warn().Err(err).Msg("failed to publish ScanStartedMessage (non-fatal)")
 		}
@@ -267,12 +270,9 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		log.Error().Err(err).Msg("failed to connect to clamd")
 		return s.handleScanFailure(ctx, d, msg, retryCount, "CLAMD_UNAVAILABLE", err.Error(), d.Headers)
 	}
-	defer clamClient.Close()
-
-	// Get engine and signature versions before scan (best effort).
-	engineVer, sigVer := s.getClamdVersions(clamClient)
 
 	finding, err := clamClient.ScanFile(msg.TempPath)
+	clamClient.Close() // Close scan connection immediately after use
 	scanDuration := time.Since(start)
 	if err != nil {
 		if err == clamd.ErrFileNotFound {
@@ -283,6 +283,9 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		log.Error().Err(err).Msg("clamd scan error")
 		return s.handleScanFailure(ctx, d, msg, retryCount, "SCAN_ERROR", err.Error(), d.Headers)
 	}
+
+	// Get engine and signature versions on a separate connection (best effort).
+	engineVer, sigVer := s.getVersionsOnNewConnection()
 
 	// Post-scan cancellation check: discard result if cancelled during scan.
 	if s.isCancelled(ctx, msg.CaseId) {
@@ -308,6 +311,7 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	}
 
 	result := model.ScanCompletedMessage{
+		MessageId:         model.NewMessageId(),
 		FileId:            msg.FileId,
 		CaseId:            msg.CaseId,
 		Verdict:           verdict,
@@ -320,7 +324,10 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		ScanDurationMs:    scanDuration.Milliseconds(),
 	}
 
-	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{Payload: result}
+	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{
+		Payload: result,
+		Headers: amqp.Table{"__TypeId__": "FileScanCompletedMessage"},
+	}
 	if err := s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope); err != nil {
 		log.Error().Err(err).Msg("failed to publish ScanCompletedMessage; NACKing original")
 		_ = d.Nack(false, false)
@@ -364,6 +371,7 @@ func (s *Scanner) handleScanFailure(
 			headerRetryCount:     int64(nextRetry),
 			headerFirstFailureAt: firstFailureAt,
 			headerLastError:      errorCode,
+			"__TypeId__":         "FileUploadedMessage",
 		}
 
 		// Publish a new file.uploaded message to the retry queue directly
@@ -387,6 +395,7 @@ func (s *Scanner) handleScanFailure(
 
 		// Publish file.scan.retrying notification for the Java Backend.
 		retryNotif := model.ScanRetryingMessage{
+			MessageId:        model.NewMessageId(),
 			FileId:           msg.FileId,
 			CaseId:           msg.CaseId,
 			RetryAttempt:     nextRetry,
@@ -397,7 +406,10 @@ func (s *Scanner) handleScanFailure(
 			NextRetryDelayMs: delayMs,
 			FailedAt:         time.Now().UTC(),
 		}
-		notifEnvelope := &mqmodel.JSONMessage[model.ScanRetryingMessage]{Payload: retryNotif}
+		notifEnvelope := &mqmodel.JSONMessage[model.ScanRetryingMessage]{
+			Payload: retryNotif,
+			Headers: amqp.Table{"__TypeId__": "FileScanRetryingMessage"},
+		}
 		// Best effort: log but don't fail if this publish doesn't confirm.
 		if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanRetryingRoutingKey, false, notifEnvelope); err != nil {
 			log.Warn().Err(err).Str("fileId", msg.FileId).Msg("failed to publish ScanRetryingMessage (non-fatal)")
@@ -418,6 +430,7 @@ func (s *Scanner) handleScanFailure(
 
 	// Retries exhausted — publish to DLX.
 	failedMsg := model.ScanFailedMessage{
+		MessageId:       model.NewMessageId(),
 		FileId:          msg.FileId,
 		CaseId:          msg.CaseId,
 		Error:           errorCode,
@@ -427,7 +440,10 @@ func (s *Scanner) handleScanFailure(
 		FailedAt:        time.Now().UTC(),
 	}
 
-	dlxEnvelope := &mqmodel.JSONMessage[model.ScanFailedMessage]{Payload: failedMsg}
+	dlxEnvelope := &mqmodel.JSONMessage[model.ScanFailedMessage]{
+		Payload: failedMsg,
+		Headers: amqp.Table{"__TypeId__": "FileScanFailedMessage"},
+	}
 	pubCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -485,6 +501,17 @@ func (s *Scanner) getClamdVersions(c *clamd.ClamClient) (engineVer, sigVer strin
 	}
 
 	return versionStr, ""
+}
+
+// getVersionsOnNewConnection opens a fresh clamd connection to retrieve version info.
+// Returns empty strings on any error (best effort, non-fatal).
+func (s *Scanner) getVersionsOnNewConnection() (engineVer, sigVer string) {
+	c, err := s.newClamdClient()
+	if err != nil {
+		return "", ""
+	}
+	defer c.Close()
+	return s.getClamdVersions(c)
 }
 
 // computeChecksumAndMagicBytes reads the file once, computing the SHA-256

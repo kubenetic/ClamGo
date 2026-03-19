@@ -1,6 +1,15 @@
 package model
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// NewMessageId generates a new UUIDv4 string for message idempotency.
+func NewMessageId() string {
+	return uuid.New().String()
+}
 
 // Verdict represents the outcome of a ClamAV scan.
 type Verdict string
@@ -34,6 +43,7 @@ type MagicByteAnalysis struct {
 // ScanCompletedMessage is published to uploader.exchange with routing key
 // file.scan.completed after ClamGo finishes scanning a file (success or infected).
 type ScanCompletedMessage struct {
+	MessageId         string            `json:"messageId"`
 	FileId            string            `json:"fileId"`
 	CaseId            string            `json:"caseId"`
 	Verdict           Verdict           `json:"verdict"`
@@ -50,6 +60,7 @@ type ScanCompletedMessage struct {
 // file.scan.retrying each time a scan fails and is scheduled for retry.
 // Consumed from q.scan.results by the Java Backend.
 type ScanRetryingMessage struct {
+	MessageId        string    `json:"messageId"`
 	FileId           string    `json:"fileId"`
 	CaseId           string    `json:"caseId"`
 	RetryAttempt     int       `json:"retryAttempt"`
@@ -72,6 +83,7 @@ type RetryHistoryEntry struct {
 // ScanFailedMessage is published to uploader.dlx with routing key
 // file.scan.failed after all 3 retries are exhausted.
 type ScanFailedMessage struct {
+	MessageId       string              `json:"messageId"`
 	FileId          string              `json:"fileId"`
 	CaseId          string              `json:"caseId"`
 	Error           string              `json:"error"`
