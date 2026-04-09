@@ -11,21 +11,25 @@ import (
 
 var ErrFileNotFound = fmt.Errorf("file not found")
 
+// scanResponseRe matches clamd SCAN responses of the form:
+//
+//	[<n>: ]<path>: <status> [FOUND]
+//
+// Examples:
+//
+//	1: /scandir/vis.dwg: OK
+//	4: /scandir/eicar.txt: Win.Test.EICAR_HDB-1 FOUND
+var scanResponseRe = regexp.MustCompile(`^(?:\s*\d+:\s*)?([^:]+):\s*(.+?)\s*(?:FOUND)?\s*$`)
+
 // parseScanResponse parses clamd scan text and returns a map[path]status where status is
 // either "OK" or the malware name without the trailing "FOUND". It ignores leading
 // numbering prefixes like "1:".
 func parseScanResponse(line string) string {
-	// Pattern matches optional leading number+colon, then a path, then colon and status
-	// Examples:
-	// 1: /scandir/vis.dwg: OK
-	// 4: /scandir/eicar.txt: Win.Test.EICAR_HDB-1 FOUND
-	re := regexp.MustCompile(`^(?:\s*\d+:\s*)?([^:]+):\s*(.+?)\s*(?:FOUND)?\s*$`)
-
 	if strings.TrimSpace(line) == "" {
 		return ""
 	}
 
-	m := re.FindStringSubmatch(line)
+	m := scanResponseRe.FindStringSubmatch(line)
 	if len(m) == 3 {
 		return strings.TrimSpace(m[2])
 	}

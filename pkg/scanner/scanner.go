@@ -40,6 +40,10 @@ const (
 	maxRetries           = 3
 )
 
+// clamVersionRe parses clamd's VERSION response.
+// Example: "ClamAV 1.4.1/27450/Wed Feb 26 08:15:00 2026"
+var clamVersionRe = regexp.MustCompile(`ClamAV\s+([^\s/]+)/(\d+)`)
+
 // retryQueueNames maps retry attempt number (1-3) to the queue name.
 var retryQueueNames = map[int]string{
 	1: "q.file.scan.retry-1",
@@ -500,8 +504,7 @@ func (s *Scanner) getClamdVersions(c *clamd.ClamClient) (engineVer, sigVer strin
 
 	// Parse "ClamAV X.Y.Z/NNNNN/..."
 	versionStr := strings.TrimSpace(string(versionBytes))
-	re := regexp.MustCompile(`ClamAV\s+([^\s/]+)/(\d+)`)
-	m := re.FindStringSubmatch(versionStr)
+	m := clamVersionRe.FindStringSubmatch(versionStr)
 	if len(m) == 3 {
 		return m[1], m[2]
 	}
