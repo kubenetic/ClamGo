@@ -30,18 +30,17 @@ rabbitmq:
   prefetchCount: 1
 
 redis:
-  # Single node configuration (backward compatible, not used when cluster enabled)
+  # Set enabled: false to skip all Redis connection attempts.
+  # ClamGo uses in-memory cancellation tracking only (via HandleCancelMessage).
+  # Set to true and configure addr or cluster.nodes to re-enable the Redis fast-check.
+  enabled: false
   addr: "127.0.0.1:6379"
   password: ""
   db: 0
-  
-  # Cluster configuration (now supported for high availability)
+
   cluster:
-    enabled: true
-    nodes:
-      - redis-0:6379
-      - redis-1:6379
-      - redis-2:6379
+    enabled: false
+    nodes: []
     password: ""
     maxRedirects: 10
 

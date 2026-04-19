@@ -63,6 +63,7 @@ func init() {
 	viper.SetDefault("rabbitmq.prefetchCount", 1)
 
 	// Redis
+	viper.SetDefault("redis.enabled", true)
 	viper.SetDefault("redis.addr", "127.0.0.1:6379")
 	viper.SetDefault("redis.password", "")
 	viper.SetDefault("redis.db", 0)
@@ -134,51 +135,55 @@ func main() {
 	// Initialize Redis client (optional: used for cancelled:{caseId} fast-check).
 	var redisClient redis.UniversalClient
 
-	clusterEnabled := viper.GetBool("redis.cluster.enabled")
+	if viper.GetBool("redis.enabled") {
+		clusterEnabled := viper.GetBool("redis.cluster.enabled")
 
-	if clusterEnabled {
-		// Cluster mode
-		nodes := viper.GetStringSlice("redis.cluster.nodes")
-		if len(nodes) > 0 {
-			redisClient = redis.NewClusterClient(&redis.ClusterOptions{
-				Addrs:        nodes,
-				Password:     viper.GetString("redis.cluster.password"),
-				MaxRedirects: viper.GetInt("redis.cluster.maxRedirects"),
-			})
+		if clusterEnabled {
+			// Cluster mode
+			nodes := viper.GetStringSlice("redis.cluster.nodes")
+			if len(nodes) > 0 {
+				redisClient = redis.NewClusterClient(&redis.ClusterOptions{
+					Addrs:        nodes,
+					Password:     viper.GetString("redis.cluster.password"),
+					MaxRedirects: viper.GetInt("redis.cluster.maxRedirects"),
+				})
 
-			log.Info().
-				Strs("nodes", nodes).
-				Msg("Redis Cluster mode enabled")
+				log.Info().
+					Strs("nodes", nodes).
+					Msg("Redis Cluster mode enabled")
+			}
+		} else {
+			// Single node mode (backward compatibility)
+			redisAddr := viper.GetString("redis.addr")
+			if redisAddr != "" {
+				redisClient = redis.NewClient(&redis.Options{
+					Addr:     redisAddr,
+					Password: viper.GetString("redis.password"),
+					DB:       viper.GetInt("redis.db"),
+				})
+
+				log.Info().
+					Str("addr", redisAddr).
+					Msg("Redis single-node mode enabled")
+			}
+		}
+
+		// Ping test (same for both modes)
+		if redisClient != nil {
+			pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+			defer pingCancel()
+			if err := redisClient.Ping(pingCtx).Err(); err != nil {
+				log.Warn().Err(err).Msg("Redis connection failed; cancellation Redis check will be disabled")
+				redisClient = nil
+			}
+
+			if redisClient != nil {
+				defer redisClient.Close()
+				log.Info().Msg("Redis connected successfully")
+			}
 		}
 	} else {
-		// Single node mode (backward compatibility)
-		redisAddr := viper.GetString("redis.addr")
-		if redisAddr != "" {
-			redisClient = redis.NewClient(&redis.Options{
-				Addr:     redisAddr,
-				Password: viper.GetString("redis.password"),
-				DB:       viper.GetInt("redis.db"),
-			})
-
-			log.Info().
-				Str("addr", redisAddr).
-				Msg("Redis single-node mode enabled")
-		}
-	}
-
-	// Ping test (same for both modes)
-	if redisClient != nil {
-		pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := redisClient.Ping(pingCtx).Err(); err != nil {
-			log.Warn().Err(err).Msg("Redis connection failed; cancellation Redis check will be disabled")
-			redisClient = nil
-		}
-		pingCancel()
-
-		if redisClient != nil {
-			defer redisClient.Close()
-			log.Info().Msg("Redis connected successfully")
-		}
+		log.Info().Msg("Redis disabled; using in-memory cancellation tracking only")
 	}
 
 	// Build scanner.
@@ -194,6 +199,7 @@ func main() {
 		ClamdUnixPath:           viper.GetString("clamd.unix.path"),
 	}
 	s := scanner.New(scannerCfg, pub, redisClient)
+	s.StartCleanup(ctx)
 
 	// Build consumers (prefetch=1 for both: process one message at a time).
 	prefetch := viper.GetInt("rabbitmq.prefetchCount")
