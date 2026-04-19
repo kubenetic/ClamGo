@@ -278,7 +278,7 @@ func TestRetryDelays(t *testing.T) {
 
 func TestScanner_MarkCancelled(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 	}
 
 	// Initially not cancelled
@@ -298,8 +298,8 @@ func TestScanner_MarkCancelled(t *testing.T) {
 func (s *Scanner) isCancelledInMemory(caseId string) bool {
 	s.cancelMu.RLock()
 	defer s.cancelMu.RUnlock()
-	_, exists := s.cancelled[caseId]
-	return exists
+	entry, exists := s.cancelled[caseId]
+	return exists && time.Since(entry.at) < cancelledTTL
 }
 
 func TestScanner_IsCancelled_WithRedis(t *testing.T) {
@@ -307,7 +307,7 @@ func TestScanner_IsCancelled_WithRedis(t *testing.T) {
 	// For now, we test the in-memory path only
 	ctx := context.Background()
 	s := &Scanner{
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 		redis:     nil, // No Redis client
 	}
 
@@ -321,11 +321,33 @@ func TestScanner_IsCancelled_WithRedis(t *testing.T) {
 	assert.True(t, s.isCancelled(ctx, "case-123"))
 }
 
+func TestScanner_EvictStaleCancelled(t *testing.T) {
+	s := &Scanner{
+		cancelled: make(map[string]cancelledEntry),
+	}
+
+	// Insert a fresh entry and an already-expired entry.
+	s.cancelMu.Lock()
+	s.cancelled["fresh-case"] = cancelledEntry{at: time.Now()}
+	s.cancelled["stale-case"] = cancelledEntry{at: time.Now().Add(-(cancelledTTL + time.Second))}
+	s.cancelMu.Unlock()
+
+	s.evictStaleCancelled()
+
+	s.cancelMu.RLock()
+	_, freshExists := s.cancelled["fresh-case"]
+	_, staleExists := s.cancelled["stale-case"]
+	s.cancelMu.RUnlock()
+
+	assert.True(t, freshExists, "fresh entry should survive eviction")
+	assert.False(t, staleExists, "stale entry should be evicted")
+}
+
 // ─── Handle Cancel Message Tests ───────────────────────────────────────────────
 
 func TestScanner_HandleCancelMessage(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 	}
 
 	msg := model.CaseCancelledMessage{
@@ -354,7 +376,7 @@ func TestScanner_HandleCancelMessage(t *testing.T) {
 
 func TestScanner_HandleCancelMessage_InvalidJSON(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 	}
 
 	delivery := amqp.Delivery{
@@ -372,7 +394,7 @@ func TestScanner_HandleCancelMessage_InvalidJSON(t *testing.T) {
 
 func TestScanner_HandleScanMessage_CancelledCase(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 		cfg: Config{
 			TempNFSPrefix: "/tmp/",
 		},
@@ -410,7 +432,7 @@ func TestScanner_HandleScanMessage_CancelledCase(t *testing.T) {
 
 func TestScanner_HandleScanMessage_InvalidTempPath(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 		cfg: Config{
 			TempNFSPrefix: "/mnt/temp-nfs/",
 		},
@@ -441,7 +463,7 @@ func TestScanner_HandleScanMessage_InvalidTempPath(t *testing.T) {
 
 func TestScanner_HandleScanMessage_InvalidJSON(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 		cfg: Config{
 			TempNFSPrefix: "/tmp/",
 		},

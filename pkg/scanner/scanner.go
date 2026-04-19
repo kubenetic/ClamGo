@@ -38,6 +38,14 @@ const (
 	headerFirstFailureAt = "x-first-failure-at"
 	headerLastError      = "x-last-error"
 	maxRetries           = 3
+
+	// cancelledTTL is how long a cancelled caseId is retained in the in-memory set.
+	// Entries older than this are evicted by the background cleanup goroutine.
+	// Matches the Redis TTL that was previously used for the cancelled:{caseId} key.
+	cancelledTTL = 24 * time.Hour
+
+	// cancelledCleanupInterval is how often the cleanup goroutine runs.
+	cancelledCleanupInterval = 30 * time.Minute
 )
 
 // clamVersionRe parses clamd's VERSION response.
@@ -90,6 +98,11 @@ type Config struct {
 	ClamdUnixPath string
 }
 
+// cancelledEntry records when a caseId was marked as cancelled.
+type cancelledEntry struct {
+	at time.Time
+}
+
 // Scanner is the main scan orchestrator. It is safe for concurrent use by
 // the case-cancelled consumer goroutine (to update the cancelled set) and
 // the scan consumer goroutine (to process messages). All shared state is
@@ -99,17 +112,51 @@ type Scanner struct {
 	pub       *rmq.Publisher
 	redis     redis.UniversalClient
 	cancelMu  sync.RWMutex
-	cancelled map[string]struct{} // in-memory cancelled caseId set
+	cancelled map[string]cancelledEntry // in-memory cancelled caseId set with timestamps
 }
 
 // New creates a Scanner. The publisher must already be initialized.
+// A background goroutine is started to evict stale cancelled entries; it stops
+// when ctx is cancelled.
 func New(cfg Config, pub *rmq.Publisher, redisClient redis.UniversalClient) *Scanner {
-	return &Scanner{
+	s := &Scanner{
 		cfg:       cfg,
 		pub:       pub,
 		redis:     redisClient,
-		cancelled: make(map[string]struct{}),
+		cancelled: make(map[string]cancelledEntry),
 	}
+	return s
+}
+
+// StartCleanup starts the background goroutine that evicts cancelled entries
+// older than cancelledTTL. It runs until ctx is cancelled.
+// Call this after New() in main, passing the application context.
+func (s *Scanner) StartCleanup(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(cancelledCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.evictStaleCancelled()
+			}
+		}
+	}()
+}
+
+// evictStaleCancelled removes cancelled entries older than cancelledTTL.
+func (s *Scanner) evictStaleCancelled() {
+	cutoff := time.Now().Add(-cancelledTTL)
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	for id, entry := range s.cancelled {
+		if entry.at.Before(cutoff) {
+			delete(s.cancelled, id)
+		}
+	}
+	log.Debug().Msg("evicted stale cancelled entries")
 }
 
 // MarkCancelled adds caseId to the in-memory cancelled set.
@@ -117,7 +164,7 @@ func New(cfg Config, pub *rmq.Publisher, redisClient redis.UniversalClient) *Sca
 func (s *Scanner) MarkCancelled(caseId string) {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
-	s.cancelled[caseId] = struct{}{}
+	s.cancelled[caseId] = cancelledEntry{at: time.Now()}
 	log.Info().Str("caseId", caseId).Msg("case marked as cancelled in memory")
 }
 
@@ -125,10 +172,10 @@ func (s *Scanner) MarkCancelled(caseId string) {
 // in-memory set and Redis for the cancelled:{caseId} key.
 func (s *Scanner) isCancelled(ctx context.Context, caseId string) bool {
 	s.cancelMu.RLock()
-	_, inMem := s.cancelled[caseId]
+	entry, inMem := s.cancelled[caseId]
 	s.cancelMu.RUnlock()
 
-	if inMem {
+	if inMem && time.Since(entry.at) < cancelledTTL {
 		return true
 	}
 
@@ -139,7 +186,7 @@ func (s *Scanner) isCancelled(ctx context.Context, caseId string) bool {
 		if err == nil && val > 0 {
 			// Cache locally to avoid future Redis hits.
 			s.cancelMu.Lock()
-			s.cancelled[caseId] = struct{}{}
+			s.cancelled[caseId] = cancelledEntry{at: time.Now()}
 			s.cancelMu.Unlock()
 			return true
 		}
@@ -239,6 +286,7 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	// Publish file.scan.started notification only on the first attempt (best effort — non-fatal on failure).
 	if retryCount == 0 {
 		startedMsg := model.ScanStartedMessage{
+			MessageId:    model.NewMessageId(),
 			FileId:       msg.FileId,
 			CaseId:       msg.CaseId,
 			OriginalName: msg.OriginalName,

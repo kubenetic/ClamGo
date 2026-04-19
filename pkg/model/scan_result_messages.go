@@ -109,6 +109,7 @@ type ScanFailedMessage struct {
 // file.scan.started when ClamGo begins processing a file.
 // Consumed from q.scan.results by the Java Backend for SSE push.
 type ScanStartedMessage struct {
+	MessageId    string    `json:"messageId"`
 	FileId       string    `json:"fileId"`
 	CaseId       string    `json:"caseId"`
 	OriginalName string    `json:"originalName"`
