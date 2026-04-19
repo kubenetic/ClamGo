@@ -63,7 +63,7 @@ func init() {
 	viper.SetDefault("rabbitmq.prefetchCount", 1)
 
 	// Redis
-	viper.SetDefault("redis.enabled", true)
+	viper.SetDefault("redis.enabled", false)
 	viper.SetDefault("redis.addr", "127.0.0.1:6379")
 	viper.SetDefault("redis.password", "")
 	viper.SetDefault("redis.db", 0)
@@ -171,9 +171,10 @@ func main() {
 		// Ping test (same for both modes)
 		if redisClient != nil {
 			pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
-			defer pingCancel()
-			if err := redisClient.Ping(pingCtx).Err(); err != nil {
-				log.Warn().Err(err).Msg("Redis connection failed; cancellation Redis check will be disabled")
+			pingErr := redisClient.Ping(pingCtx).Err()
+			pingCancel()
+			if pingErr != nil {
+				log.Warn().Err(pingErr).Msg("Redis connection failed; cancellation Redis check will be disabled")
 				redisClient = nil
 			}
 

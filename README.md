@@ -23,14 +23,16 @@ ClamGo is a high-performance, distributed malware scanning service that leverage
   - Retry 2: 120 seconds
   - Retry 3: 600 seconds
 - **Dead Letter Queue (DLQ)**: Permanent failure routing for manual inspection
-- **Cancellation Handling**: Dual-layer cancellation checking (in-memory + Redis)
+- **Cancellation Handling**: Dual-layer cancellation checking (in-memory + optional Redis fast-path)
+  - In-memory set with 24-hour TTL; background eviction every 30 minutes
+  - Redis fast-path is opt-in (`redis.enabled: true`); falls back to in-memory when disabled or unreachable
 - **Message Acknowledgment**: Smart ACK/NACK handling with custom routing
 
 ### Scalability & Performance
 - **Distributed Architecture**: Message queue-based decoupling
 - **Worker Pooling**: Configurable concurrent scanner instances
 - **Asynchronous Processing**: Non-blocking scan operations
-- **Redis Integration**: Optional fast-path cancellation checks
+- **Redis Integration**: Optional fast-path cancellation checks (disabled by default; enable with `redis.enabled: true`)
 - **NFS Support**: Optimized for shared storage environments
 
 ### Enterprise Features
@@ -200,23 +202,32 @@ rabbitmq:
   # Exchange and queue configuration
   exchange: "uploader.exchange"
   dlx: "uploader.dlx"
-  
+
   scanQueue: "q.file.scan"
   cancelQueue: "q.case.cancelled"
 
   # Routing keys for result publishing
   scanCompletedRoutingKey: "file.scan.completed"
-  scanRetryingRoutingKey: "file.scan.retrying"
-  dlqRoutingKey: "file.scan.failed"
+  scanRetryingRoutingKey:  "file.scan.retrying"
+  dlqRoutingKey:           "file.scan.failed"
+  scanStartedRoutingKey:   "file.scan.started"
 
   # Consumer settings
   prefetchCount: 1
 
-# Redis for cancellation checks
+# Redis for cancellation fast-path (disabled by default).
+# Set enabled: true and configure addr to activate.
+# ClamGo falls back to in-memory-only tracking when disabled or unreachable.
 redis:
+  enabled: false
   addr: "127.0.0.1:6379"
   password: ""
   db: 0
+  cluster:
+    enabled: false
+    nodes: []
+    password: ""
+    maxRedirects: 10
 
 # Temporary NFS storage
 tempNFS:
@@ -242,7 +253,8 @@ export CLAMGO_RABBITMQ_PORT="5672"
 export CLAMGO_RABBITMQ_USERNAME="guest"
 export CLAMGO_RABBITMQ_PASSWORD="guest"
 
-# Redis configuration
+# Redis configuration (opt-in)
+export CLAMGO_REDIS_ENABLED="true"
 export CLAMGO_REDIS_ADDR="redis.example.com:6379"
 export CLAMGO_REDIS_PASSWORD="password"
 
@@ -329,6 +341,7 @@ services:
       - CLAMGO_CLAMD_TCP_ADDR=clamav:3310
       - CLAMGO_RABBITMQ_HOST=rabbitmq
       - CLAMGO_RABBITMQ_PORT=5672
+      - CLAMGO_REDIS_ENABLED=true
       - CLAMGO_REDIS_ADDR=redis:6379
       - CLAMGO_LOGGING_LEVEL=info
       - CLAMGO_TEMPNFS_PREFIX=/tmp/
@@ -350,42 +363,111 @@ docker-compose up -d
 
 ### Input: File Upload Message
 
+Published by `tusd-token-hook` after a file is fully uploaded.
+
 ```json
 {
-  "fileId": "file-uuid-123",
-  "caseId": "case-uuid-456",
+  "fileId": "f285646f-4c09-aac1-1450-5a9aa9dc5e76",
+  "caseId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "tempPath": "/mnt/temp-nfs/uploads/f285646f-4c09-aac1-1450-5a9aa9dc5e76",
   "originalName": "document.pdf",
+  "sizeBytes": 1048576,
   "contentType": "application/pdf",
-  "size": 1024000,
-  "tempPath": "/mnt/temp-nfs/uploads/file-uuid-123"
+  "uploadedAt": "2025-03-01T12:00:00Z"
 }
 ```
 
-**RabbitMQ Queue**: `q.file.scan`  
-**RabbitMQ Exchange**: `uploader.exchange`
+**RabbitMQ Queue**: `q.file.scan`
 
-### Output: Scan Result Message
+### Output: Scan Completed Message
+
+Published to `uploader.exchange` with routing key `file.scan.completed` on every finished scan (clean or infected).
 
 ```json
 {
-  "fileId": "file-uuid-123",
-  "caseId": "case-uuid-456",
-  "originalName": "document.pdf",
-  "sha256": "abc123def456...",
+  "messageId": "uuid-v4",
+  "fileId": "f285646f-4c09-aac1-1450-5a9aa9dc5e76",
+  "caseId": "a1b2c3d4-0000-0000-0000-000000000001",
   "verdict": "CLEAN",
-  "signature": "",
-  "scanDuration": 1200,
-  "timestamp": "2025-03-01T12:00:00Z"
+  "threatName": "",
+  "checksumSha256": "abc123def456...",
+  "magicByteAnalysis": {
+    "detectedMimeType": "application/pdf",
+    "claimedMimeType": "application/pdf",
+    "claimedExtension": ".pdf",
+    "consistency": "CONSISTENT"
+  },
+  "engineVersion": "1.4.1",
+  "signatureVersion": "27450",
+  "scannedAt": "2025-03-01T12:00:01Z",
+  "scanDurationMs": 320
 }
 ```
 
-**RabbitMQ Routing Key**: `file.scan.completed` (success) or `file.scan.retrying` (retry)
+Possible `verdict` values: `CLEAN`, `INFECTED`, `ERROR`.  
+Possible `consistency` values: `CONSISTENT`, `MINOR_MISMATCH`, `MISMATCH`, `UNKNOWN`, `EMPTY`.
 
-### Cancellation Message
+### Output: Scan Started Message
+
+Published to `uploader.exchange` with routing key `file.scan.started` on the **first** attempt only (not on retries).
 
 ```json
 {
-  "caseId": "case-uuid-456"
+  "messageId": "uuid-v4",
+  "fileId": "f285646f-4c09-aac1-1450-5a9aa9dc5e76",
+  "caseId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "originalName": "document.pdf",
+  "sizeBytes": 1048576,
+  "startedAt": "2025-03-01T12:00:00Z"
+}
+```
+
+### Output: Scan Retrying Message
+
+Published to `uploader.exchange` with routing key `file.scan.retrying` each time a scan fails and is scheduled for retry.
+
+```json
+{
+  "messageId": "uuid-v4",
+  "fileId": "f285646f-4c09-aac1-1450-5a9aa9dc5e76",
+  "caseId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "retryAttempt": 1,
+  "maxRetries": 3,
+  "error": "CLAMD_UNAVAILABLE",
+  "message": "connect clamd tcp localhost:3310: connection refused",
+  "nextRetryQueue": "q.file.scan.retry-1",
+  "nextRetryDelayMs": 30000,
+  "failedAt": "2025-03-01T12:00:05Z"
+}
+```
+
+### Output: Scan Failed Message (DLQ)
+
+Published to `uploader.dlx` with routing key `file.scan.failed` after all 3 retries are exhausted.
+
+```json
+{
+  "messageId": "uuid-v4",
+  "fileId": "f285646f-4c09-aac1-1450-5a9aa9dc5e76",
+  "caseId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "error": "CLAMD_UNAVAILABLE",
+  "message": "...",
+  "retryCount": 3,
+  "originalMessage": { "...": "..." },
+  "failedAt": "2025-03-01T12:10:00Z"
+}
+```
+
+### Input: Case Cancelled Message
+
+Published by the Java Backend when a case is cancelled by a user.
+
+```json
+{
+  "caseId": "a1b2c3d4-0000-0000-0000-000000000001",
+  "cancelledBy": "user@example.com",
+  "cancelledAt": "2025-03-01T12:05:00Z",
+  "fileIds": ["f285646f-4c09-aac1-1450-5a9aa9dc5e76"]
 }
 ```
 
@@ -405,62 +487,53 @@ golangci-lint run ./...
 # Format code
 go fmt ./...
 
-# Run tests with coverage
-go test -v -race -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
+# Run unit tests (no external dependencies required)
+go test -v -race ./...
+
+# Run integration tests (requires Docker)
+go test -v -race -tags integration -timeout 300s ./...
 ```
 
-### Testing ClamAV Integration
+### Test Suite
 
-```bash
-# Start ClamAV container
-mkdir -p /tmp/clamav/{scandir,database,clamd}
-chown -R 100:101 /tmp/clamav
-chmod -R 770 /tmp/clamav
+ClamGo has two test layers:
 
-docker run --detach \
-  --name=clamav \
-  --mount type=bind,source=/tmp/clamav/scandir/,target=/scandir/ \
-  --mount type=bind,source=/tmp/clamav/database/,target=/var/lib/clamav \
-  --mount type=bind,source=/tmp/clamav/clamd/,target=/tmp/ \
-  docker.io/clamav/clamav:latest
+| Layer | Command | Dependencies | Coverage |
+|---|---|---|---|
+| **Unit** | `go test ./...` | None | Magic bytes, retry headers, cancellation logic, UUID normalisation |
+| **Integration** | `go test -tags integration ./...` | Docker | RabbitMQ message flow, Redis cancellation, combined scenarios |
 
-# Wait for database initialization (first run can take 5-10 minutes)
-docker logs -f clamav
+Integration tests use [testcontainers-go](https://golang.testcontainers.org/) to spin up real containers:
+- `rabbitmq:4.1-management-alpine` — full AMQP topology declared in `TestMain`
+- `redis:7-alpine` — single-node Redis for cancellation fast-path tests
+- `clamav/clamav:1.5.1` — ClamAV daemon for clamd client tests
 
-# Test clamd connection
-nc -zv localhost 3310
-```
+The `//go:build integration` tag keeps containers out of the default `go test` run.
 
 ### Code Structure
 
 ```
 ClamGo/
 ├── main.go                 # Application entry point
-├── cmd/                    # Command-line utilities (future)
 ├── pkg/
 │   ├── scanner/           # Core scanning logic
-│   │   ├── scanner.go
-│   │   ├── scanner_test.go
-│   │   └── ...
+│   │   ├── scanner.go          # Scan pipeline, cancellation, retry routing
+│   │   ├── scanner_test.go     # Unit tests (magic bytes, headers, cancellation)
+│   │   └── integration_test.go # Integration tests (RabbitMQ + Redis, build tag: integration)
 │   ├── service/
-│   │   ├── clamd/         # ClamAV daemon client
-│   │   │   ├── client.go
-│   │   │   ├── scan.go
-│   │   │   ├── ping.go
-│   │   │   ├── version.go
-│   │   │   ├── stats.go
-│   │   │   └── ...
-│   │   └── ...
-│   ├── model/             # Data structures & protobuf definitions
-│   │   ├── file_uploaded_message.go
-│   │   ├── scan_result_messages.go
-│   │   ├── case_cancelled_message.go
-│   │   ├── clamd_*.go
-│   │   └── ...
-│   └── ...
-├── api/
-│   └── scan.proto         # Protocol buffer definitions
+│   │   └── clamd/         # ClamAV daemon client
+│   │       ├── client.go
+│   │       ├── scan.go
+│   │       ├── ping.go
+│   │       ├── version.go
+│   │       ├── stats.go
+│   │       ├── ping_test.go    # Integration test (build tag: integration)
+│   │       └── version_test.go # Integration test (build tag: integration)
+│   └── model/             # Message types & domain models
+│       ├── file_uploaded_message.go
+│       ├── scan_result_messages.go
+│       ├── case_cancelled_message.go
+│       └── clamd_*.go
 ├── configs/
 │   └── config.yaml        # Default configuration
 ├── build/
@@ -469,7 +542,6 @@ ClamGo/
 ├── docs/
 │   ├── arch.md           # Architecture diagrams
 │   └── development.md    # Development guide
-├── test/                  # Integration tests
 ├── .github/               # CI/CD workflows
 ├── go.mod & go.sum       # Dependency management
 ├── .golangci.yml         # Linting configuration
@@ -606,7 +678,8 @@ Contributions are welcome! Please follow these guidelines:
 
 2. **Code Quality**: 
    - Run `golangci-lint run ./...` before submitting
-   - Ensure tests pass: `go test -v ./...`
+   - Ensure unit tests pass: `go test -v -race ./...`
+   - Ensure integration tests pass: `go test -v -race -tags integration -timeout 300s ./...`
    - Maintain >80% code coverage
 
 3. **Pull Requests**:
@@ -689,6 +762,8 @@ spec:
           value: "clamd.antivirus.svc:3310"
         - name: CLAMGO_RABBITMQ_HOST
           value: "rabbitmq.messaging.svc"
+        - name: CLAMGO_REDIS_ENABLED
+          value: "true"
         - name: CLAMGO_REDIS_ADDR
           value: "redis.cache.svc:6379"
         resources:
