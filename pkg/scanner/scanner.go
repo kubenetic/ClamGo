@@ -151,12 +151,16 @@ func (s *Scanner) evictStaleCancelled() {
 	cutoff := time.Now().Add(-cancelledTTL)
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
+	evicted := 0
 	for id, entry := range s.cancelled {
 		if entry.at.Before(cutoff) {
 			delete(s.cancelled, id)
+			evicted++
 		}
 	}
-	log.Debug().Msg("evicted stale cancelled entries")
+	if evicted > 0 {
+		log.Debug().Int("count", evicted).Msg("evicted stale cancelled entries")
+	}
 }
 
 // MarkCancelled adds caseId to the in-memory cancelled set.
