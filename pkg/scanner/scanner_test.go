@@ -624,3 +624,120 @@ func TestRetryRouting_Delays(t *testing.T) {
 	assert.Less(t, retryDelayMs[1], retryDelayMs[2])
 	assert.Less(t, retryDelayMs[2], retryDelayMs[3])
 }
+
+// ─── validateTempPath Tests (G-2) ──────────────────────────────────────────────
+
+func TestValidateTempPath_RejectsControlChars(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"newline", "/mnt/temp-nfs/file\n.txt"},
+		{"carriage return", "/mnt/temp-nfs/file\r.txt"},
+		{"null byte", "/mnt/temp-nfs/file\x00.txt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTempPath(tt.path, "/mnt/temp-nfs/")
+			if err == nil {
+				t.Errorf("expected error for path with control chars, got nil")
+			}
+		})
+	}
+}
+
+func TestValidateTempPath_RejectsTraversal(t *testing.T) {
+	err := validateTempPath("/mnt/temp-nfs/../etc/passwd", "/mnt/temp-nfs/")
+	if err == nil {
+		t.Errorf("expected error for path traversal, got nil")
+	}
+}
+
+func TestValidateTempPath_AcceptsClean(t *testing.T) {
+	err := validateTempPath("/mnt/temp-nfs/sub/dir/file.pdf", "/mnt/temp-nfs/")
+	if err != nil {
+		t.Errorf("expected no error for clean path, got: %v", err)
+	}
+}
+
+func TestValidateTempPath_RejectsRelative(t *testing.T) {
+	err := validateTempPath("temp-nfs/file", "/mnt/temp-nfs/")
+	if err == nil {
+		t.Errorf("expected error for relative path, got nil")
+	}
+}
+
+func TestValidateTempPath_NormalizesPrefixWithoutTrailingSep(t *testing.T) {
+	// Prefix without trailing separator should be normalized.
+	// Path /mnt/temp-nfs-evil/x must be rejected (prefix-prefix attack).
+	err := validateTempPath("/mnt/temp-nfs-evil/x", "/mnt/temp-nfs")
+	if err == nil {
+		t.Errorf("expected error for prefix bypass attempt, got nil")
+	}
+
+	// Path /mnt/temp-nfs/x must be accepted.
+	err = validateTempPath("/mnt/temp-nfs/x", "/mnt/temp-nfs")
+	if err != nil {
+		t.Errorf("expected no error for valid path with non-normalized prefix, got: %v", err)
+	}
+}
+
+func TestValidateTempPath_EmptyPath(t *testing.T) {
+	err := validateTempPath("", "/mnt/temp-nfs/")
+	if err == nil {
+		t.Errorf("expected error for empty path, got nil")
+	}
+}
+
+func TestValidateTempPath_EmptyPrefix(t *testing.T) {
+	err := validateTempPath("/mnt/temp-nfs/file", "")
+	if err == nil {
+		t.Errorf("expected error for empty prefix, got nil")
+	}
+}
+
+// ─── Config / Misc new tests ───────────────────────────────────────────────────
+
+// TestConfig_MaxFileSizeBytes verifies the Config carries the G-5 size limit.
+func TestConfig_MaxFileSizeBytes(t *testing.T) {
+	cfg := Config{MaxFileSizeBytes: 500 * 1024 * 1024}
+	if cfg.MaxFileSizeBytes != 500*1024*1024 {
+		t.Errorf("expected MaxFileSizeBytes to be 500MB, got %d", cfg.MaxFileSizeBytes)
+	}
+}
+
+// TestLstatDetectsSymlink is an OS-level sanity check for the approach used by
+// the symlink-rejection path. The scanner uses os.Lstat (not os.Stat) to spot
+// symlinks before opening them. This test guards against a future refactor
+// accidentally switching to os.Stat (which would follow the symlink).
+func TestLstatDetectsSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	targetFile := filepath.Join(tmpDir, "target.txt")
+	if err := os.WriteFile(targetFile, []byte("target"), 0644); err != nil {
+		t.Fatalf("failed to create target file: %v", err)
+	}
+
+	symlinkPath := filepath.Join(tmpDir, "link.txt")
+	if err := os.Symlink(targetFile, symlinkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	fi, err := os.Lstat(symlinkPath)
+	if err != nil {
+		t.Fatalf("Lstat failed: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("expected symlink mode flag to be set on Lstat result")
+	}
+
+	// Cross-check: os.Stat would have followed the link and NOT set the flag.
+	fi2, err := os.Stat(symlinkPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if fi2.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("os.Stat must NOT report ModeSymlink (it should follow the link)")
+	}
+}

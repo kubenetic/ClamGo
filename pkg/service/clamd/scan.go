@@ -1,37 +1,46 @@
 package clamd
 
 import (
+	"errors"
 	"fmt"
-	"path"
-	"regexp"
+	"path/filepath"
 	"strings"
 
 	"ClamGo/pkg/model"
 )
 
-var ErrFileNotFound = fmt.Errorf("file not found")
+var (
+	ErrFileNotFound   = errors.New("file not found")
+	ErrClamdScanError = errors.New("clamd scan error")
+)
 
-// scanResponseRe matches clamd SCAN responses of the form:
-//
-//	[<n>: ]<path>: <status> [FOUND]
-//
-// Examples:
-//
-//	1: /scandir/vis.dwg: OK
-//	4: /scandir/eicar.txt: Win.Test.EICAR_HDB-1 FOUND
-var scanResponseRe = regexp.MustCompile(`^(?:\s*\d+:\s*)?([^:]+):\s*(.+?)\s*(?:FOUND)?\s*$`)
-
-// parseScanResponse parses clamd scan text and returns a map[path]status where status is
-// either "OK" or the malware name without the trailing "FOUND". It ignores leading
-// numbering prefixes like "1:".
+// parseScanResponse parses clamd scan response lines and returns:
+//   - "OK" if the line ends with " OK"
+//   - the malware name if the line ends with " FOUND"
+//   - the full line if it ends with " ERROR"
+//   - "" otherwise
 func parseScanResponse(line string) string {
-	if strings.TrimSpace(line) == "" {
+	line = strings.TrimSpace(line)
+	if line == "" {
 		return ""
 	}
 
-	m := scanResponseRe.FindStringSubmatch(line)
-	if len(m) == 3 {
-		return strings.TrimSpace(m[2])
+	if strings.HasSuffix(line, " ERROR") {
+		return line
+	}
+
+	if strings.HasSuffix(line, " FOUND") {
+		// Extract malware name: substring between the LAST ": " and " FOUND"
+		lastColon := strings.LastIndex(line, ": ")
+		if lastColon >= 0 {
+			malwareName := line[lastColon+2 : len(line)-6] // -6 for " FOUND"
+			return malwareName
+		}
+		return ""
+	}
+
+	if strings.HasSuffix(line, " OK") {
+		return "OK"
 	}
 
 	return ""
@@ -42,7 +51,7 @@ func (client *ClamClient) ScanFile(filePath string) (string, error) {
 		return "", fmt.Errorf("mqConn is nil")
 	}
 
-	if !path.IsAbs(filePath) {
+	if !filepath.IsAbs(filePath) {
 		return "", fmt.Errorf("file path (%s) must be absolute", filePath)
 	}
 
@@ -58,8 +67,17 @@ func (client *ClamClient) ScanFile(filePath string) (string, error) {
 
 	finding := parseScanResponse(string(response))
 
-	if finding == "File path check failure: No such file or directory. ERROR" {
+	// clamd prefixes ERROR responses with the scanned path, e.g.
+	//   "/mnt/temp-nfs/abc: File path check failure: No such file or directory. ERROR"
+	// so compare against the suffix rather than the bare sentence.
+	if strings.HasSuffix(finding, "File path check failure: No such file or directory. ERROR") {
 		return "", ErrFileNotFound
+	}
+
+	// Detect ERROR responses (but not the file-not-found case handled above).
+	// ERROR responses end with " ERROR" and indicate transient failures.
+	if strings.HasSuffix(finding, " ERROR") {
+		return "", fmt.Errorf("%w: %s", ErrClamdScanError, finding)
 	}
 
 	return finding, nil

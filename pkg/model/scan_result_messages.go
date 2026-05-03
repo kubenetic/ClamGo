@@ -6,6 +6,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// TypeId constants for message routing and identification.
+const (
+	TypeIdFileUploaded      = "FileUploadedMessage"
+	TypeIdFileScanStarted   = "FileScanStartedMessage"
+	TypeIdFileScanCompleted = "FileScanCompletedMessage"
+	TypeIdFileScanRetrying  = "FileScanRetryingMessage"
+	TypeIdFileScanFailed    = "FileScanFailedMessage"
+)
+
 // NewMessageId generates a new UUIDv4 string for message idempotency.
 func NewMessageId() string {
 	return uuid.New().String()

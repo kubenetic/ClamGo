@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -61,6 +62,8 @@ func init() {
 	viper.SetDefault("rabbitmq.dlqRoutingKey", "file.scan.failed")
 	viper.SetDefault("rabbitmq.scanStartedRoutingKey", "file.scan.started")
 	viper.SetDefault("rabbitmq.prefetchCount", 1)
+	viper.SetDefault("rabbitmq.scanHandlerTimeoutSeconds", 600)
+	viper.SetDefault("rabbitmq.cancelPrefetchCount", 10)
 
 	// Redis
 	viper.SetDefault("redis.enabled", false)
@@ -69,13 +72,16 @@ func init() {
 	viper.SetDefault("redis.db", 0)
 
 	// Redis Cluster
-	viper.SetDefault("redis.cluster.enabled", true)
+	viper.SetDefault("redis.cluster.enabled", false)
 	viper.SetDefault("redis.cluster.nodes", []string{"redis-0:6379", "redis-1:6379", "redis-2:6379"})
 	viper.SetDefault("redis.cluster.password", "")
 	viper.SetDefault("redis.cluster.maxRedirects", 10)
 
 	// Temp NFS
 	viper.SetDefault("tempNFS.prefix", "/mnt/temp-nfs/")
+
+	// Scanner
+	viper.SetDefault("scanner.maxFileSizeBytes", 500*1024*1024) // 500 MB
 
 	// Health server
 	viper.SetDefault("health.port", 8080)
@@ -198,20 +204,35 @@ func main() {
 		ScanStartedRoutingKey:   viper.GetString("rabbitmq.scanStartedRoutingKey"),
 		ClamdTCPAddr:            viper.GetString("clamd.tcp.addr"),
 		ClamdUnixPath:           viper.GetString("clamd.unix.path"),
+		MaxFileSizeBytes:        viper.GetInt64("scanner.maxFileSizeBytes"),
 	}
+
+	// Validate TempNFSPrefix
+	if scannerCfg.TempNFSPrefix == "" {
+		log.Fatal().Msg("tempNFS.prefix must be configured and non-empty")
+	}
+	if !strings.HasSuffix(scannerCfg.TempNFSPrefix, string(filepath.Separator)) {
+		scannerCfg.TempNFSPrefix += string(filepath.Separator)
+	}
+	if !filepath.IsAbs(scannerCfg.TempNFSPrefix) {
+		log.Fatal().Str("prefix", scannerCfg.TempNFSPrefix).Msg("tempNFS.prefix must be an absolute path")
+	}
+
 	s := scanner.New(scannerCfg, pub, redisClient)
 	s.StartCleanup(ctx)
 
 	// Build consumers (prefetch=1 for both: process one message at a time).
 	prefetch := viper.GetInt("rabbitmq.prefetchCount")
+	scanHandlerTimeout := time.Duration(viper.GetInt("rabbitmq.scanHandlerTimeoutSeconds")) * time.Second
 
-	scanConsumer, err := rmq.NewConsumer(mqConn, rmq.WithPrefetchCount(prefetch))
+	scanConsumer, err := rmq.NewConsumer(mqConn, rmq.WithPrefetchCount(prefetch), rmq.WithMessageHandlerTimeout(scanHandlerTimeout))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create scan consumer")
 	}
 	defer scanConsumer.Close()
 
-	cancelConsumer, err := rmq.NewConsumer(mqConn, rmq.WithPrefetchCount(10))
+	cancelPrefetch := viper.GetInt("rabbitmq.cancelPrefetchCount")
+	cancelConsumer, err := rmq.NewConsumer(mqConn, rmq.WithPrefetchCount(cancelPrefetch))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create cancel consumer")
 	}
@@ -221,22 +242,26 @@ func main() {
 	cancelQueue := viper.GetString("rabbitmq.cancelQueue")
 
 	// Start health check HTTP server.
+	// Binds to 127.0.0.1 only — Kubernetes liveness/readiness probes reach it
+	// via localhost, and we avoid exposing version metadata on all interfaces.
 	healthPort := viper.GetInt("health.port")
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"status":    "ok",
-				"version":   Version,
-				"buildTime": BuildTime,
-			})
+	healthMux := http.NewServeMux()
+	healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":    "ok",
+			"version":   Version,
+			"buildTime": BuildTime,
 		})
-
-		addr := fmt.Sprintf(":%d", healthPort)
-		log.Info().Str("addr", addr).Msg("starting health check server")
-		if err := http.ListenAndServe(addr, mux); err != nil && ctx.Err() == nil {
+	})
+	healthSrv := &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", healthPort),
+		Handler: healthMux,
+	}
+	go func() {
+		log.Info().Str("addr", healthSrv.Addr).Msg("starting health check server")
+		if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("health check server failed")
 		}
 	}()
@@ -256,6 +281,15 @@ func main() {
 	if err := scanConsumer.Subscribe(ctx, scanQueue, tag, s.HandleScanMessage); err != nil && ctx.Err() == nil {
 		log.Error().Err(err).Msg("scan consumer stopped unexpectedly")
 		os.Exit(1)
+	}
+
+	// Gracefully shut down the health server now that consumers have stopped.
+	// This prevents Kubernetes from routing probe traffic to a pod that is no
+	// longer processing messages.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	if err := healthSrv.Shutdown(shutCtx); err != nil {
+		log.Warn().Err(err).Msg("health check server shutdown error")
 	}
 
 	log.Info().Msg("ClamGo shutdown complete")

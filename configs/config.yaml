@@ -29,6 +29,12 @@ rabbitmq:
   # Consumer QoS
   prefetchCount: 1
 
+  # Scan handler timeout (seconds) — must exceed clamdIOTimeout (60s) and cover large files with retries
+  scanHandlerTimeoutSeconds: 600
+
+  # Cancel consumer prefetch count
+  cancelPrefetchCount: 10
+
 redis:
   # Set enabled: false to skip all Redis connection attempts.
   # ClamGo uses in-memory cancellation tracking only (via HandleCancelMessage).

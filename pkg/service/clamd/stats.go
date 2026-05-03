@@ -22,7 +22,14 @@ func (client *ClamClient) Stats() (*model.ClamMetrics, error) {
 		return nil, fmt.Errorf("mqConn is nil")
 	}
 
-	response, err := client.sendAndReceive(model.CmdStats)
+	// STATS produces a multi-line response terminated by "END\n".
+	// sendAndReceive only reads the first line, so we send the command manually
+	// and then consume all lines until the END terminator.
+	if err := client.sendCommand(model.CmdStats); err != nil {
+		return nil, err
+	}
+
+	response, err := client.readMultiLine()
 	if err != nil {
 		return nil, err
 	}

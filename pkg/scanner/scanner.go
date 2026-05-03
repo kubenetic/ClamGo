@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"ClamGo/pkg/model"
@@ -32,6 +34,14 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
+
+// publishCtx returns a context that inherits values from parent but whose
+// cancellation is independent, with the given timeout. This guarantees that
+// a publish performed after a long clamd scan is not instantly cancelled
+// because the message-handler context already expired.
+func publishCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+}
 
 const (
 	headerRetryCount     = "x-retry-count"
@@ -46,6 +56,10 @@ const (
 
 	// cancelledCleanupInterval is how often the cleanup goroutine runs.
 	cancelledCleanupInterval = 30 * time.Minute
+
+	// maxCancelledEntries is the maximum number of entries in the cancelled map.
+	// Prevents unbounded memory growth from a flood of cancellation messages.
+	maxCancelledEntries = 100_000
 )
 
 // clamVersionRe parses clamd's VERSION response.
@@ -64,6 +78,40 @@ var retryDelayMs = map[int]int64{
 	1: 30_000,
 	2: 120_000,
 	3: 600_000,
+}
+
+// validateTempPath validates that path is safe for scanning.
+// It checks for control characters, path traversal, and ensures the path
+// starts with the required prefix.
+func validateTempPath(path, prefix string) error {
+	if path == "" {
+		return fmt.Errorf("temp path is empty")
+	}
+
+	if prefix == "" {
+		return fmt.Errorf("temp path prefix is empty")
+	}
+
+	if strings.ContainsAny(path, "\r\n\x00") {
+		return fmt.Errorf("temp path contains control characters")
+	}
+
+	cleaned := filepath.Clean(path)
+
+	if !filepath.IsAbs(cleaned) {
+		return fmt.Errorf("temp path must be absolute: %s", cleaned)
+	}
+
+	// Normalize prefix to end with separator
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+
+	if !strings.HasPrefix(cleaned+string(filepath.Separator), prefix) {
+		return fmt.Errorf("temp path does not start with required prefix %s: %s", prefix, cleaned)
+	}
+
+	return nil
 }
 
 // Config holds all configuration needed by the Scanner.
@@ -96,6 +144,10 @@ type Config struct {
 
 	// ClamdUnixPath is the path to the clamd Unix socket.
 	ClamdUnixPath string
+
+	// MaxFileSizeBytes is the maximum allowed file size for scanning.
+	// Files larger than this are rejected with VerdictError.
+	MaxFileSizeBytes int64
 }
 
 // cancelledEntry records when a caseId was marked as cancelled.
@@ -168,8 +220,12 @@ func (s *Scanner) evictStaleCancelled() {
 func (s *Scanner) MarkCancelled(caseId string) {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
-	s.cancelled[caseId] = cancelledEntry{at: time.Now()}
-	log.Info().Str("caseId", caseId).Msg("case marked as cancelled in memory")
+	if len(s.cancelled) >= maxCancelledEntries {
+		log.Warn().Int("size", len(s.cancelled)).Msg("Cancelled entries map at capacity; skipping add")
+	} else {
+		s.cancelled[caseId] = cancelledEntry{at: time.Now()}
+		log.Info().Str("caseId", caseId).Msg("case marked as cancelled in memory")
+	}
 }
 
 // isCancelled returns true if the case has been cancelled, checking both the
@@ -183,10 +239,12 @@ func (s *Scanner) isCancelled(ctx context.Context, caseId string) bool {
 		return true
 	}
 
-	// Check Redis as a second-level fast-check.
+	// Check Redis as a second-level fast-check with a short timeout.
 	if s.redis != nil {
+		redisCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
 		key := fmt.Sprintf("cancelled:%s", caseId)
-		val, err := s.redis.Exists(ctx, key).Result()
+		val, err := s.redis.Exists(redisCtx, key).Result()
 		if err == nil && val > 0 {
 			// Cache locally to avoid future Redis hits.
 			s.cancelMu.Lock()
@@ -206,6 +264,8 @@ func (s *Scanner) isCancelled(ctx context.Context, caseId string) bool {
 func (s *Scanner) HandleScanMessage(ctx context.Context, d amqp.Delivery) error {
 	var msg model.FileUploadedMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
+		// Unmarshal errors indicate malformed messages that cannot be recovered by retry.
+		// ACK to discard and prevent requeue loops.
 		log.Error().Err(err).Msg("failed to unmarshal FileUploadedMessage; discarding (ACK)")
 		_ = d.Ack(false)
 		return nil
@@ -225,17 +285,14 @@ func (s *Scanner) HandleScanMessage(ctx context.Context, d amqp.Delivery) error 
 	// Pre-check: is the case cancelled?
 	if s.isCancelled(ctx, msg.CaseId) {
 		log.Info().Msg("case is cancelled; discarding message (ACK without scan)")
-		_ = d.Ack(false)
+		ackLogErr(d)
 		return nil
 	}
 
 	// Validate temp path prefix to prevent path traversal.
-	if s.cfg.TempNFSPrefix != "" && !strings.HasPrefix(msg.TempPath, s.cfg.TempNFSPrefix) {
-		log.Error().
-			Str("tempPath", msg.TempPath).
-			Str("requiredPrefix", s.cfg.TempNFSPrefix).
-			Msg("temp path does not match required prefix; discarding (ACK)")
-		_ = d.Ack(false)
+	if err := validateTempPath(msg.TempPath, s.cfg.TempNFSPrefix); err != nil {
+		log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("temp path validation failed; discarding (ACK)")
+		ackLogErr(d)
 		return nil
 	}
 
@@ -259,12 +316,12 @@ func (s *Scanner) HandleCancelMessage(ctx context.Context, d amqp.Delivery) erro
 	var msg model.CaseCancelledMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
 		log.Error().Err(err).Msg("failed to unmarshal CaseCancelledMessage; discarding (ACK)")
-		_ = d.Ack(false)
+		ackLogErr(d)
 		return nil
 	}
 
 	s.MarkCancelled(msg.CaseId)
-	_ = d.Ack(false)
+	ackLogErr(d)
 	return nil
 }
 
@@ -278,14 +335,76 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		Int("retryCount", retryCount).
 		Logger()
 
-	// Open the file.
-	f, err := os.Open(msg.TempPath)
+	// Check for symlinks before opening the file (security: prevent arbitrary-file-read/delete).
+	// This is a fast-path rejection, but the real protection is O_NOFOLLOW on open.
+	fi, err := os.Lstat(msg.TempPath)
 	if err != nil {
 		log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("file not found or unreadable; discarding (ACK)")
-		_ = d.Ack(false)
+		ackLogErr(d)
 		return nil
 	}
-	defer f.Close()
+	if fi.Mode()&os.ModeSymlink != 0 {
+		log.Warn().Str("tempPath", msg.TempPath).Msg("symlink detected; rejecting for security (ACK without scan)")
+		// Notify the uploader so the file is marked ERROR instead of stuck
+		// in SCANNING forever. Best-effort — if the rejection publish fails,
+		// we still ACK (the orphan-sweep job is the fallback).
+		_ = s.publishRejection(ctx, msg, "SYMLINK_REJECTED")
+		ackLogErr(d)
+		return nil
+	}
+
+	// Check file size limit from message metadata (fast path).
+	if s.cfg.MaxFileSizeBytes > 0 && msg.SizeBytes > s.cfg.MaxFileSizeBytes {
+		log.Error().
+			Int64("sizeBytes", msg.SizeBytes).
+			Int64("maxFileSizeBytes", s.cfg.MaxFileSizeBytes).
+			Msg("file exceeds maximum size; discarding (ACK)")
+		// Notify the uploader so the file is marked ERROR rather than hanging
+		// in SCANNING. Best-effort: if the publish fails the orphan-sweep
+		// job will eventually reap the file, but the user will see no
+		// immediate feedback.
+		_ = s.publishRejection(ctx, msg, "FILE_TOO_LARGE")
+		ackLogErr(d)
+		return nil
+	}
+
+	// Open the file with O_NOFOLLOW to prevent symlink attacks (TOCTOU mitigation).
+	f, err := os.OpenFile(msg.TempPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		// If the error is ELOOP, it means the path is a symlink — report as security violation.
+		if errors.Is(err, syscall.ELOOP) {
+			log.Warn().Err(err).Str("tempPath", msg.TempPath).Msg("symlink detected at open time; rejecting for security (ACK)")
+			_ = s.publishRejection(ctx, msg, "SYMLINK_REJECTED")
+			ackLogErr(d)
+			return nil
+		}
+		log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("failed to open file; discarding (ACK)")
+		ackLogErr(d)
+		return nil
+	}
+
+	// Verify actual file size from the opened file descriptor (don't trust msg.SizeBytes from client).
+	fi, err = f.Stat()
+	if err != nil {
+		f.Close()
+		log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("failed to stat opened file; discarding (ACK)")
+		ackLogErr(d)
+		return nil
+	}
+	if s.cfg.MaxFileSizeBytes > 0 && fi.Size() > s.cfg.MaxFileSizeBytes {
+		f.Close()
+		log.Error().
+			Int64("actualSize", fi.Size()).
+			Int64("maxFileSizeBytes", s.cfg.MaxFileSizeBytes).
+			Msg("file exceeds maximum size on stat; discarding (ACK)")
+		_ = s.publishRejection(ctx, msg, "FILE_TOO_LARGE")
+		ackLogErr(d)
+		return nil
+	}
+	// No defer here — we close explicitly below before passing the path to clamd.
+	// Using both a defer and an explicit close would cause a double-close, which
+	// risks closing an unrelated file descriptor that the OS recycled after the
+	// first close.
 
 	// Publish file.scan.started notification only on the first attempt (best effort — non-fatal on failure).
 	if retryCount == 0 {
@@ -299,11 +418,13 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		}
 		startedEnvelope := &mqmodel.JSONMessage[model.ScanStartedMessage]{
 			Payload: startedMsg,
-			Headers: amqp.Table{"__TypeId__": "FileScanStartedMessage"},
+			Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanStarted},
 		}
-		if err := s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanStartedRoutingKey, false, startedEnvelope); err != nil {
+		pubCtx, pubCancel := publishCtx(ctx, 15*time.Second)
+		if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanStartedRoutingKey, false, startedEnvelope); err != nil {
 			log.Warn().Err(err).Msg("failed to publish ScanStartedMessage (non-fatal)")
 		}
+		pubCancel()
 	}
 
 	// Compute SHA-256 and magic bytes in one pass.
@@ -312,17 +433,13 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		log.Warn().Err(mimeErr).Msg("magic byte detection failed; proceeding with UNKNOWN consistency")
 	}
 
-	// Rewind file for clamd scan.
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		log.Error().Err(err).Msg("failed to rewind file for clamd scan")
-		return s.handleScanFailure(ctx, d, msg, retryCount, "SCAN_ERROR", err.Error(), d.Headers)
-	}
-	f.Close() // clamd reads by path; close before passing path
+	// Close file once reading is done; clamd reads by path.
+	f.Close()
 
 	// Post-rewind cancellation check.
 	if s.isCancelled(ctx, msg.CaseId) {
 		log.Info().Msg("case cancelled during file read; discarding scan job (ACK)")
-		_ = d.Ack(false)
+		ackLogErr(d)
 		return nil
 	}
 
@@ -339,8 +456,13 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	if err != nil {
 		if err == clamd.ErrFileNotFound {
 			log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("clamd could not find file; discarding (ACK)")
-			_ = d.Ack(false)
+			ackLogErr(d)
 			return nil
+		}
+		// Check if this is a clamd scan error (transient failure, should retry).
+		if errors.Is(err, clamd.ErrClamdScanError) {
+			log.Error().Err(err).Msg("clamd scan error; scheduling retry")
+			return s.handleScanFailure(ctx, d, msg, retryCount, "CLAMD_SCAN_ERROR", err.Error(), d.Headers)
 		}
 		log.Error().Err(err).Msg("clamd scan error")
 		return s.handleScanFailure(ctx, d, msg, retryCount, "SCAN_ERROR", err.Error(), d.Headers)
@@ -352,8 +474,12 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	// Post-scan cancellation check: discard result if cancelled during scan.
 	if s.isCancelled(ctx, msg.CaseId) {
 		log.Info().Msg("case cancelled during scan; discarding result, deleting temp file")
-		_ = os.Remove(msg.TempPath)
-		_ = d.Ack(false)
+		if removeErr := os.Remove(msg.TempPath); removeErr != nil {
+			if !errors.Is(removeErr, os.ErrNotExist) {
+				log.Warn().Err(removeErr).Str("tempPath", msg.TempPath).Msg("failed to delete cancelled file")
+			}
+		}
+		ackLogErr(d)
 		return nil
 	}
 
@@ -368,7 +494,9 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		threatName = finding
 		// Delete infected file immediately.
 		if removeErr := os.Remove(msg.TempPath); removeErr != nil {
-			log.Warn().Err(removeErr).Str("tempPath", msg.TempPath).Msg("failed to delete infected file")
+			if !errors.Is(removeErr, os.ErrNotExist) {
+				log.Warn().Err(removeErr).Str("tempPath", msg.TempPath).Msg("failed to delete infected file")
+			}
 		}
 	}
 
@@ -388,13 +516,16 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 
 	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{
 		Payload: result,
-		Headers: amqp.Table{"__TypeId__": "FileScanCompletedMessage"},
+		Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanCompleted},
 	}
-	if err := s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope); err != nil {
-		log.Error().Err(err).Msg("failed to publish ScanCompletedMessage; NACKing original")
-		_ = d.Nack(false, false)
+	pubCtx, pubCancel := publishCtx(ctx, 15*time.Second)
+	if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope); err != nil {
+		log.Error().Err(err).Msg("failed to publish ScanCompletedMessage; NACKing original (transient failure, will requeue)")
+		pubCancel()
+		nackLogErr(d, true)
 		return err
 	}
+	pubCancel()
 
 	log.Info().
 		Str("verdict", string(verdict)).
@@ -402,7 +533,7 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		Int64("durationMs", scanDuration.Milliseconds()).
 		Msg("scan completed, result published")
 
-	_ = d.Ack(false)
+	ackLogErr(d)
 	return nil
 }
 
@@ -443,15 +574,15 @@ func (s *Scanner) handleScanFailure(
 			Headers: retryHeaders,
 		}
 
-		pubCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-
-		if err := s.pub.Publish(pubCtx, "", queueName, false, retryEnvelope); err != nil {
+		retryPubCtx, retryPubCancel := publishCtx(ctx, 15*time.Second)
+		err := s.pub.Publish(retryPubCtx, "", queueName, false, retryEnvelope)
+		retryPubCancel()
+		if err != nil {
 			log.Error().Err(err).
 				Str("fileId", msg.FileId).
 				Str("queueName", queueName).
-				Msg("failed to publish retry message; NACKing")
-			_ = d.Nack(false, false)
+				Msg("failed to publish retry message; NACKing (transient failure, will requeue)")
+			nackLogErr(d, true)
 			return err
 		}
 
@@ -470,12 +601,15 @@ func (s *Scanner) handleScanFailure(
 		}
 		notifEnvelope := &mqmodel.JSONMessage[model.ScanRetryingMessage]{
 			Payload: retryNotif,
-			Headers: amqp.Table{"__TypeId__": "FileScanRetryingMessage"},
+			Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanRetrying},
 		}
 		// Best effort: log but don't fail if this publish doesn't confirm.
-		if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanRetryingRoutingKey, false, notifEnvelope); err != nil {
+		// Uses its own timeout so a slow retry publish cannot starve this one.
+		notifPubCtx, notifPubCancel := publishCtx(ctx, 15*time.Second)
+		if err := s.pub.Publish(notifPubCtx, s.cfg.Exchange, s.cfg.ScanRetryingRoutingKey, false, notifEnvelope); err != nil {
 			log.Warn().Err(err).Str("fileId", msg.FileId).Msg("failed to publish ScanRetryingMessage (non-fatal)")
 		}
+		notifPubCancel()
 
 		log.Warn().
 			Str("fileId", msg.FileId).
@@ -486,7 +620,7 @@ func (s *Scanner) handleScanFailure(
 			Str("retryQueue", queueName).
 			Msgf("scan failed, scheduling retry %d/%d", nextRetry, maxRetries)
 
-		_ = d.Ack(false)
+		ackLogErr(d)
 		return nil
 	}
 
@@ -504,16 +638,16 @@ func (s *Scanner) handleScanFailure(
 
 	dlxEnvelope := &mqmodel.JSONMessage[model.ScanFailedMessage]{
 		Payload: failedMsg,
-		Headers: amqp.Table{"__TypeId__": "FileScanFailedMessage"},
+		Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanFailed},
 	}
-	pubCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	if err := s.pub.Publish(pubCtx, s.cfg.DLX, s.cfg.DLQRoutingKey, false, dlxEnvelope); err != nil {
+	dlxPubCtx, dlxPubCancel := publishCtx(ctx, 15*time.Second)
+	err := s.pub.Publish(dlxPubCtx, s.cfg.DLX, s.cfg.DLQRoutingKey, false, dlxEnvelope)
+	dlxPubCancel()
+	if err != nil {
 		log.Error().Err(err).
 			Str("fileId", msg.FileId).
-			Msg("failed to publish ScanFailedMessage to DLX; NACKing")
-		_ = d.Nack(false, false)
+			Msg("failed to publish ScanFailedMessage to DLX; NACKing (transient failure, will requeue)")
+		nackLogErr(d, true)
 		return err
 	}
 
@@ -523,7 +657,7 @@ func (s *Scanner) handleScanFailure(
 		Str("error", errorCode).
 		Msgf("scan permanently failed after %d retries for file %s", retryCount, msg.FileId)
 
-	_ = d.Ack(false)
+	ackLogErr(d)
 	return nil
 }
 
@@ -612,6 +746,8 @@ func computeChecksumAndMagicBytes(r io.Reader, originalName, claimedMimeType str
 }
 
 // classifyConsistency determines how well the detected MIME type matches the claimed one.
+// When the claimed MIME type is absent but a file extension is present, the extension
+// is resolved to a MIME type and used as the reference for comparison.
 func classifyConsistency(detected, claimed, ext string) model.MagicByteConsistency {
 	if detected == "" {
 		return model.ConsistencyUnknown
@@ -620,20 +756,33 @@ func classifyConsistency(detected, claimed, ext string) model.MagicByteConsisten
 		return model.ConsistencyEmpty
 	}
 
-	detectedBase := mimeBase(detected)
-	claimedBase := mimeBase(claimed)
+	// When no claimed MIME type is provided, derive one from the file extension.
+	// This prevents a misleading EMPTY verdict for files like "document.pdf" where
+	// the claimed MIME type is absent but the extension clearly matches the detected type.
+	reference := claimed
+	if reference == "" && ext != "" {
+		reference = extToMime(ext)
+	}
 
-	if detectedBase == claimedBase {
+	// If the extension is unknown we still have no reference to compare against.
+	if reference == "" {
+		return model.ConsistencyEmpty
+	}
+
+	detectedBase := mimeBase(detected)
+	referenceBase := mimeBase(reference)
+
+	if detectedBase == referenceBase {
 		return model.ConsistencyConsistent
 	}
 
-	// Check whether the detected type is a well-known alias for the claimed type.
-	if mimeAlias(detected, claimed) || mimeAlias(claimed, detected) {
+	// Check whether the detected type is a well-known alias for the reference type.
+	if mimeAlias(detected, reference) || mimeAlias(reference, detected) {
 		return model.ConsistencyConsistent
 	}
 
 	// Same top-level type (e.g. both "application/*") but different subtype.
-	if sameTopLevel(detected, claimed) {
+	if sameTopLevel(detected, reference) {
 		return model.ConsistencyMinorMismatch
 	}
 
@@ -674,6 +823,44 @@ func mimeAlias(a, b string) bool {
 	return false
 }
 
+// extToMime maps a lowercase file extension (with leading dot, e.g. ".pdf") to
+// a canonical MIME type string. Returns an empty string for unknown extensions.
+// The table covers the file types most commonly submitted through BaNyA.
+var extMimeMap = map[string]string{
+	".pdf":  "application/pdf",
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".zip":  "application/zip",
+	".rar":  "application/x-rar-compressed",
+	".7z":   "application/x-7z-compressed",
+	".tar":  "application/x-tar",
+	".gz":   "application/gzip",
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".bmp":  "image/bmp",
+	".tif":  "image/tiff",
+	".tiff": "image/tiff",
+	".svg":  "image/svg+xml",
+	".txt":  "text/plain",
+	".csv":  "text/csv",
+	".xml":  "application/xml",
+	".json": "application/json",
+	".html": "text/html",
+	".htm":  "text/html",
+	".dwg":  "image/vnd.dwg",
+	".dxf":  "image/vnd.dxf",
+}
+
+func extToMime(ext string) string {
+	return extMimeMap[strings.ToLower(ext)]
+}
+
 // extractRetryCount reads the x-retry-count integer header from AMQP headers.
 // Returns 0 if the header is absent or cannot be parsed.
 func extractRetryCount(headers amqp.Table) int {
@@ -708,4 +895,64 @@ func extractStringHeader(headers amqp.Table, key string) string {
 	}
 	s, _ := v.(string)
 	return s
+}
+
+// ackLogErr logs an error if ACK fails.
+// publishRejection publishes a ScanCompletedMessage with VerdictError for a
+// file that was rejected before the clamd scan could run (symlink, oversize,
+// etc.). This ensures the uploader transitions the file out of SCANNING into
+// a terminal ERROR state and notifies the user, instead of leaking the file
+// in SCANNING forever and relying on the orphan-sweep job.
+//
+// Best-effort: if publishing the rejection notice fails, we log and return
+// the error so the caller can decide whether to ACK-discard (accepting that
+// the uploader will never know) or NACK-requeue (accepting that the broker
+// will keep re-delivering a file we've already decided to reject). Both the
+// current callers choose ACK-discard — a rejected file is by definition not
+// going to be scanned, so redelivery would loop forever.
+func (s *Scanner) publishRejection(ctx context.Context, msg model.FileUploadedMessage, reason string) error {
+	result := model.ScanCompletedMessage{
+		MessageId:      model.NewMessageId(),
+		FileId:         msg.FileId,
+		CaseId:         msg.CaseId,
+		Verdict:        model.VerdictError,
+		ThreatName:     reason,
+		ChecksumSha256: "",
+		ScannedAt:      time.Now().UTC(),
+		ScanDurationMs: 0,
+	}
+	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{
+		Payload: result,
+		Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanCompleted},
+	}
+	pubCtx, cancel := publishCtx(ctx, 15*time.Second)
+	defer cancel()
+	if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope); err != nil {
+		log.Error().
+			Err(err).
+			Str("fileId", msg.FileId).
+			Str("caseId", msg.CaseId).
+			Str("reason", reason).
+			Msg("failed to publish rejection (VerdictError) message")
+		return err
+	}
+	log.Info().
+		Str("fileId", msg.FileId).
+		Str("caseId", msg.CaseId).
+		Str("reason", reason).
+		Msg("published rejection (VerdictError) message to uploader")
+	return nil
+}
+
+func ackLogErr(d amqp.Delivery) {
+	if err := d.Ack(false); err != nil {
+		log.Warn().Err(err).Uint64("deliveryTag", d.DeliveryTag).Msg("ack failed")
+	}
+}
+
+// nackLogErr logs an error if NACK fails.
+func nackLogErr(d amqp.Delivery, requeue bool) {
+	if err := d.Nack(false, requeue); err != nil {
+		log.Warn().Err(err).Uint64("deliveryTag", d.DeliveryTag).Bool("requeue", requeue).Msg("nack failed")
+	}
 }
