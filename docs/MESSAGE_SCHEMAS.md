@@ -661,21 +661,21 @@ q.file.scan.retry-1:
   durable: true
   queue_arguments:
     x-dead-letter-exchange: uploader.exchange
-    x-dead-letter-routing-key: file.scan.completed
+    x-dead-letter-routing-key: file.scan.retry.expired
     x-message-ttl: 30000
 
 q.file.scan.retry-2:
   durable: true
   queue_arguments:
     x-dead-letter-exchange: uploader.exchange
-    x-dead-letter-routing-key: file.scan.completed
+    x-dead-letter-routing-key: file.scan.retry.expired
     x-message-ttl: 120000
 
 q.file.scan.retry-3:
   durable: true
   queue_arguments:
     x-dead-letter-exchange: uploader.exchange
-    x-dead-letter-routing-key: file.scan.completed
+    x-dead-letter-routing-key: file.scan.retry.expired
     x-message-ttl: 600000
 
 q.case.cancelled:
