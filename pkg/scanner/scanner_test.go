@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -205,6 +207,26 @@ func TestExtractRetryCount(t *testing.T) {
 			expected: 2,
 		},
 		{
+			name:     "float64 with fractional part",
+			headers:  amqp.Table{headerRetryCount: float64(2.5)},
+			expected: 0, // Should reject non-integer float
+		},
+		{
+			name:     "float64 NaN",
+			headers:  amqp.Table{headerRetryCount: math.NaN()},
+			expected: 0, // Should reject NaN
+		},
+		{
+			name:     "float64 positive infinity",
+			headers:  amqp.Table{headerRetryCount: math.Inf(1)},
+			expected: 0, // Should reject infinity
+		},
+		{
+			name:     "float64 negative infinity",
+			headers:  amqp.Table{headerRetryCount: math.Inf(-1)},
+			expected: 0, // Should reject negative infinity
+		},
+		{
 			name:     "string value (not parseable)",
 			headers:  amqp.Table{headerRetryCount: "not-a-number"},
 			expected: 0,
@@ -278,7 +300,8 @@ func TestRetryDelays(t *testing.T) {
 
 func TestScanner_MarkCancelled(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 	}
 
 	// Initially not cancelled
@@ -294,11 +317,50 @@ func TestScanner_MarkCancelled(t *testing.T) {
 	assert.False(t, s.isCancelledInMemory("case-456"))
 }
 
+// TestScanner_MarkCancelled_LRUCapacity tests that the LRU mechanism works correctly
+// when the current generation reaches capacity.
+func TestScanner_MarkCancelled_LRUCapacity(t *testing.T) {
+	s := &Scanner{
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
+	}
+
+	// Fill the current generation to capacity
+	for i := 0; i < maxCancelledEntries; i++ {
+		caseId := fmt.Sprintf("case-%d", i)
+		s.MarkCancelled(caseId)
+	}
+
+	s.cancelMu.RLock()
+	assert.Equal(t, maxCancelledEntries, len(s.cancelledCurrent))
+	assert.Equal(t, 0, len(s.cancelledPrev))
+	s.cancelMu.RUnlock()
+
+	// Add one more entry; this should trigger generation swap
+	s.MarkCancelled("case-overflow")
+
+	s.cancelMu.RLock()
+	// Current generation should have only the new entry
+	assert.Equal(t, 1, len(s.cancelledCurrent))
+	// Previous generation should have the old entries
+	assert.Equal(t, maxCancelledEntries, len(s.cancelledPrev))
+	s.cancelMu.RUnlock()
+
+	// Verify the new entry is in current generation
+	assert.True(t, s.isCancelledInMemory("case-overflow"))
+
+	// Verify old entries are still accessible (from previous generation)
+	s.cancelMu.RLock()
+	_, exists := s.cancelledPrev["case-0"]
+	s.cancelMu.RUnlock()
+	assert.True(t, exists, "old entry should be in previous generation")
+}
+
 // Helper to check in-memory cancellation without Redis
 func (s *Scanner) isCancelledInMemory(caseId string) bool {
 	s.cancelMu.RLock()
 	defer s.cancelMu.RUnlock()
-	entry, exists := s.cancelled[caseId]
+	entry, exists := s.cancelledCurrent[caseId]
 	return exists && time.Since(entry.at) < cancelledTTL
 }
 
@@ -307,8 +369,9 @@ func TestScanner_IsCancelled_WithRedis(t *testing.T) {
 	// For now, we test the in-memory path only
 	ctx := context.Background()
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
-		redis:     nil, // No Redis client
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
+		redis:            nil, // No Redis client
 	}
 
 	// Not cancelled
@@ -323,20 +386,21 @@ func TestScanner_IsCancelled_WithRedis(t *testing.T) {
 
 func TestScanner_EvictStaleCancelled(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 	}
 
 	// Insert a fresh entry and an already-expired entry.
 	s.cancelMu.Lock()
-	s.cancelled["fresh-case"] = cancelledEntry{at: time.Now()}
-	s.cancelled["stale-case"] = cancelledEntry{at: time.Now().Add(-(cancelledTTL + time.Second))}
+	s.cancelledCurrent["fresh-case"] = cancelledEntry{at: time.Now()}
+	s.cancelledCurrent["stale-case"] = cancelledEntry{at: time.Now().Add(-(cancelledTTL + time.Second))}
 	s.cancelMu.Unlock()
 
 	s.evictStaleCancelled()
 
 	s.cancelMu.RLock()
-	_, freshExists := s.cancelled["fresh-case"]
-	_, staleExists := s.cancelled["stale-case"]
+	_, freshExists := s.cancelledCurrent["fresh-case"]
+	_, staleExists := s.cancelledCurrent["stale-case"]
 	s.cancelMu.RUnlock()
 
 	assert.True(t, freshExists, "fresh entry should survive eviction")
@@ -347,7 +411,8 @@ func TestScanner_EvictStaleCancelled(t *testing.T) {
 
 func TestScanner_HandleCancelMessage(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 	}
 
 	msg := model.CaseCancelledMessage{
@@ -376,7 +441,8 @@ func TestScanner_HandleCancelMessage(t *testing.T) {
 
 func TestScanner_HandleCancelMessage_InvalidJSON(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 	}
 
 	delivery := amqp.Delivery{
@@ -394,7 +460,8 @@ func TestScanner_HandleCancelMessage_InvalidJSON(t *testing.T) {
 
 func TestScanner_HandleScanMessage_CancelledCase(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 		cfg: Config{
 			TempNFSPrefix: "/tmp/",
 		},
@@ -432,7 +499,8 @@ func TestScanner_HandleScanMessage_CancelledCase(t *testing.T) {
 
 func TestScanner_HandleScanMessage_InvalidTempPath(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 		cfg: Config{
 			TempNFSPrefix: "/mnt/temp-nfs/",
 		},
@@ -463,7 +531,8 @@ func TestScanner_HandleScanMessage_InvalidTempPath(t *testing.T) {
 
 func TestScanner_HandleScanMessage_InvalidJSON(t *testing.T) {
 	s := &Scanner{
-		cancelled: make(map[string]cancelledEntry),
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 		cfg: Config{
 			TempNFSPrefix: "/tmp/",
 		},
@@ -551,6 +620,22 @@ func TestComputeChecksumAndMagicBytes_LargeFile(t *testing.T) {
 	assert.Len(t, checksum, 64)
 }
 
+func TestComputeChecksumAndMagicBytes_ReadError(t *testing.T) {
+	// Create a mock reader that fails on read
+	failingReader := &failingReader{}
+
+	_, _, err := computeChecksumAndMagicBytes(failingReader, "test.pdf", "application/pdf")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sha256 computation")
+}
+
+// failingReader is a mock io.Reader that always fails
+type failingReader struct{}
+
+func (f *failingReader) Read(p []byte) (n int, err error) {
+	return 0, fmt.Errorf("simulated read error")
+}
+
 // ─── Mock Types ────────────────────────────────────────────────────────────────
 
 type mockAcknowledger struct {
@@ -601,7 +686,8 @@ func TestScanner_New(t *testing.T) {
 	assert.NotNil(t, s)
 	assert.Equal(t, cfg.TempNFSPrefix, s.cfg.TempNFSPrefix)
 	assert.Equal(t, cfg.Exchange, s.cfg.Exchange)
-	assert.NotNil(t, s.cancelled)
+	assert.NotNil(t, s.cancelledCurrent)
+	assert.NotNil(t, s.cancelledPrev)
 }
 
 // ─── Retry Queue Routing Tests ─────────────────────────────────────────────────

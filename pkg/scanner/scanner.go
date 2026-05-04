@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -148,6 +149,10 @@ type Config struct {
 	// MaxFileSizeBytes is the maximum allowed file size for scanning.
 	// Files larger than this are rejected with VerdictError.
 	MaxFileSizeBytes int64
+
+	// StaleFilesLogDir is the directory where orphaned files are logged for manual cleanup.
+	// If empty, defaults to /var/lib/clamgo.
+	StaleFilesLogDir string
 }
 
 // cancelledEntry records when a caseId was marked as cancelled.
@@ -160,11 +165,12 @@ type cancelledEntry struct {
 // the scan consumer goroutine (to process messages). All shared state is
 // protected by the cancelMu mutex.
 type Scanner struct {
-	cfg       Config
-	pub       *rmq.Publisher
-	redis     redis.UniversalClient
-	cancelMu  sync.RWMutex
-	cancelled map[string]cancelledEntry // in-memory cancelled caseId set with timestamps
+	cfg              Config
+	pub              *rmq.Publisher
+	redis            redis.UniversalClient
+	cancelMu         sync.RWMutex
+	cancelledCurrent map[string]cancelledEntry // current generation of cancelled caseIds
+	cancelledPrev    map[string]cancelledEntry // previous generation (for LRU eviction)
 }
 
 // New creates a Scanner. The publisher must already be initialized.
@@ -172,10 +178,11 @@ type Scanner struct {
 // when ctx is cancelled.
 func New(cfg Config, pub *rmq.Publisher, redisClient redis.UniversalClient) *Scanner {
 	s := &Scanner{
-		cfg:       cfg,
-		pub:       pub,
-		redis:     redisClient,
-		cancelled: make(map[string]cancelledEntry),
+		cfg:              cfg,
+		pub:              pub,
+		redis:            redisClient,
+		cancelledCurrent: make(map[string]cancelledEntry),
+		cancelledPrev:    make(map[string]cancelledEntry),
 	}
 	return s
 }
@@ -204,9 +211,15 @@ func (s *Scanner) evictStaleCancelled() {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
 	evicted := 0
-	for id, entry := range s.cancelled {
+	for id, entry := range s.cancelledCurrent {
 		if entry.at.Before(cutoff) {
-			delete(s.cancelled, id)
+			delete(s.cancelledCurrent, id)
+			evicted++
+		}
+	}
+	for id, entry := range s.cancelledPrev {
+		if entry.at.Before(cutoff) {
+			delete(s.cancelledPrev, id)
 			evicted++
 		}
 	}
@@ -217,26 +230,54 @@ func (s *Scanner) evictStaleCancelled() {
 
 // MarkCancelled adds caseId to the in-memory cancelled set.
 // Called by the case.cancelled consumer goroutine.
+// Uses a two-generation LRU approach: when the current generation reaches capacity,
+// it is swapped with the previous generation (evicting the oldest entries).
 func (s *Scanner) MarkCancelled(caseId string) {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
-	if len(s.cancelled) >= maxCancelledEntries {
-		log.Warn().Int("size", len(s.cancelled)).Msg("Cancelled entries map at capacity; skipping add")
-	} else {
-		s.cancelled[caseId] = cancelledEntry{at: time.Now()}
-		log.Info().Str("caseId", caseId).Msg("case marked as cancelled in memory")
+
+	// If already in current generation, update timestamp and return.
+	if _, exists := s.cancelledCurrent[caseId]; exists {
+		s.cancelledCurrent[caseId] = cancelledEntry{at: time.Now()}
+		return
 	}
+
+	// If current generation is at capacity, swap generations (evict oldest).
+	if len(s.cancelledCurrent) >= maxCancelledEntries {
+		log.Warn().
+			Int("currentSize", len(s.cancelledCurrent)).
+			Int("prevSize", len(s.cancelledPrev)).
+			Msg("cancelled entries current generation at capacity; swapping generations")
+		s.cancelledPrev = s.cancelledCurrent
+		s.cancelledCurrent = make(map[string]cancelledEntry)
+	}
+
+	s.cancelledCurrent[caseId] = cancelledEntry{at: time.Now()}
+	log.Info().Str("caseId", caseId).Msg("case marked as cancelled in memory")
 }
 
 // isCancelled returns true if the case has been cancelled, checking both the
-// in-memory set and Redis for the cancelled:{caseId} key.
+// in-memory set (current and previous generations) and Redis for the cancelled:{caseId} key.
 func (s *Scanner) isCancelled(ctx context.Context, caseId string) bool {
 	s.cancelMu.RLock()
-	entry, inMem := s.cancelled[caseId]
+	entry, inMemCurrent := s.cancelledCurrent[caseId]
+	_, inMemPrev := s.cancelledPrev[caseId]
 	s.cancelMu.RUnlock()
 
-	if inMem && time.Since(entry.at) < cancelledTTL {
+	if inMemCurrent && time.Since(entry.at) < cancelledTTL {
 		return true
+	}
+
+	if inMemPrev {
+		// Entry is in previous generation; still valid if within TTL.
+		// Promote it to current generation for faster future lookups.
+		s.cancelMu.Lock()
+		if prevEntry, exists := s.cancelledPrev[caseId]; exists && time.Since(prevEntry.at) < cancelledTTL {
+			s.cancelledCurrent[caseId] = cancelledEntry{at: time.Now()}
+			s.cancelMu.Unlock()
+			return true
+		}
+		s.cancelMu.Unlock()
 	}
 
 	// Check Redis as a second-level fast-check with a short timeout.
@@ -248,7 +289,7 @@ func (s *Scanner) isCancelled(ctx context.Context, caseId string) bool {
 		if err == nil && val > 0 {
 			// Cache locally to avoid future Redis hits.
 			s.cancelMu.Lock()
-			s.cancelled[caseId] = cancelledEntry{at: time.Now()}
+			s.cancelledCurrent[caseId] = cancelledEntry{at: time.Now()}
 			s.cancelMu.Unlock()
 			return true
 		}
@@ -323,6 +364,65 @@ func (s *Scanner) HandleCancelMessage(ctx context.Context, d amqp.Delivery) erro
 	s.MarkCancelled(msg.CaseId)
 	ackLogErr(d)
 	return nil
+}
+
+// removeFileWithRetry attempts to remove a file, retrying once after 1 second if the first attempt fails.
+// If both attempts fail, the path is appended to the stale-files log for manual cleanup.
+// Returns true if the file was successfully removed or doesn't exist, false if it remains orphaned.
+func (s *Scanner) removeFileWithRetry(filePath string) bool {
+	// First attempt
+	err := os.Remove(filePath)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+
+	// Log the first failure
+	log.Warn().Err(err).Str("tempPath", filePath).Msg("failed to delete file; retrying after 1 second")
+
+	// Retry after 1 second
+	time.Sleep(1 * time.Second)
+	err = os.Remove(filePath)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+
+	// Both attempts failed; log to stale-files ledger
+	log.Warn().Err(err).Str("tempPath", filePath).Msg("failed to delete file after retry; logging to stale-files ledger")
+	s.logOrphanFile(filePath)
+	return false
+}
+
+// logOrphanFile appends the file path to the stale-files log for manual cleanup.
+// Creates the log file if it doesn't exist.
+func (s *Scanner) logOrphanFile(filePath string) {
+	logDir := s.cfg.StaleFilesLogDir
+	if logDir == "" {
+		logDir = "/var/lib/clamgo"
+	}
+	logFile := filepath.Join(logDir, "stale-files.log")
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Error().Err(err).Str("dir", logDir).Msg("failed to create stale-files log directory")
+		return
+	}
+
+	// Append the path to the log file
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Error().Err(err).Str("logFile", logFile).Msg("failed to open stale-files log")
+		return
+	}
+	defer f.Close()
+
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	entry := fmt.Sprintf("%s %s\n", timestamp, filePath)
+	if _, err := f.WriteString(entry); err != nil {
+		log.Error().Err(err).Str("logFile", logFile).Msg("failed to write to stale-files log")
+		return
+	}
+
+	log.Info().Str("logFile", logFile).Str("filePath", filePath).Msg("orphan file logged for cleanup")
 }
 
 // runScan performs the full scan pipeline for a single file.
@@ -430,7 +530,8 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	// Compute SHA-256 and magic bytes in one pass.
 	sha256hex, magicAnalysis, mimeErr := computeChecksumAndMagicBytes(f, msg.OriginalName, msg.ContentType)
 	if mimeErr != nil {
-		log.Warn().Err(mimeErr).Msg("magic byte detection failed; proceeding with UNKNOWN consistency")
+		log.Error().Err(mimeErr).Msg("magic byte detection failed; treating as scan error")
+		return s.handleScanFailure(ctx, d, msg, retryCount, "MAGIC_BYTE_ERROR", mimeErr.Error(), d.Headers)
 	}
 
 	// Close file once reading is done; clamd reads by path.
@@ -474,11 +575,7 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	// Post-scan cancellation check: discard result if cancelled during scan.
 	if s.isCancelled(ctx, msg.CaseId) {
 		log.Info().Msg("case cancelled during scan; discarding result, deleting temp file")
-		if removeErr := os.Remove(msg.TempPath); removeErr != nil {
-			if !errors.Is(removeErr, os.ErrNotExist) {
-				log.Warn().Err(removeErr).Str("tempPath", msg.TempPath).Msg("failed to delete cancelled file")
-			}
-		}
+		s.removeFileWithRetry(msg.TempPath)
 		ackLogErr(d)
 		return nil
 	}
@@ -493,11 +590,7 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		verdict = model.VerdictInfected
 		threatName = finding
 		// Delete infected file immediately.
-		if removeErr := os.Remove(msg.TempPath); removeErr != nil {
-			if !errors.Is(removeErr, os.ErrNotExist) {
-				log.Warn().Err(removeErr).Str("tempPath", msg.TempPath).Msg("failed to delete infected file")
-			}
-		}
+		s.removeFileWithRetry(msg.TempPath)
 	}
 
 	result := model.ScanCompletedMessage{
@@ -863,6 +956,7 @@ func extToMime(ext string) string {
 
 // extractRetryCount reads the x-retry-count integer header from AMQP headers.
 // Returns 0 if the header is absent or cannot be parsed.
+// For float64 values, bounds-checks against math.MaxInt to prevent overflow.
 func extractRetryCount(headers amqp.Table) int {
 	if headers == nil {
 		return 0
@@ -873,12 +967,26 @@ func extractRetryCount(headers amqp.Table) int {
 	}
 	switch val := v.(type) {
 	case int64:
+		if val > math.MaxInt || val < math.MinInt {
+			log.Warn().Int64("value", val).Msg("retry count out of bounds")
+			return 0
+		}
 		return int(val)
 	case int32:
 		return int(val)
 	case int:
 		return val
 	case float64:
+		// Bounds-check float64 before casting to int to prevent overflow/precision loss.
+		if val > float64(math.MaxInt) || val < float64(math.MinInt) || math.IsNaN(val) || math.IsInf(val, 0) {
+			log.Warn().Float64("value", val).Msg("retry count out of bounds or invalid")
+			return 0
+		}
+		// Check for fractional part (non-integer float).
+		if val != math.Trunc(val) {
+			log.Warn().Float64("value", val).Msg("retry count is not an integer")
+			return 0
+		}
 		return int(val)
 	}
 	return 0

@@ -54,6 +54,10 @@ tempNFS:
   # ClamGo rejects file paths that do not start with this prefix.
   prefix: "/mnt/temp-nfs/"
 
+scanner:
+  maxFileSizeBytes: 524288000
+  staleFilesLogDir: "/var/lib/clamgo"
+
 health:
   port: 8080
 

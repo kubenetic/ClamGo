@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -52,7 +53,7 @@ func init() {
 	viper.SetDefault("rabbitmq.host", "127.0.0.1")
 	viper.SetDefault("rabbitmq.port", 5672)
 	viper.SetDefault("rabbitmq.username", "")
-	viper.SetDefault("rabbitmq.password", "")
+	viper.SetDefault("rabbitmq.vhost", "/")
 	viper.SetDefault("rabbitmq.exchange", "uploader.exchange")
 	viper.SetDefault("rabbitmq.dlx", "uploader.dlx")
 	viper.SetDefault("rabbitmq.scanQueue", "q.file.scan")
@@ -82,6 +83,7 @@ func init() {
 
 	// Scanner
 	viper.SetDefault("scanner.maxFileSizeBytes", 500*1024*1024) // 500 MB
+	viper.SetDefault("scanner.staleFilesLogDir", "/var/lib/clamgo")
 
 	// Health server
 	viper.SetDefault("health.port", 8080)
@@ -119,17 +121,40 @@ func main() {
 	defer cancel()
 
 	// Initialize RabbitMQ connection manager.
-	amqpURI := fmt.Sprintf("amqp://%s:%s@%s:%d/",
-		viper.GetString("rabbitmq.username"),
-		viper.GetString("rabbitmq.password"),
-		viper.GetString("rabbitmq.host"),
-		viper.GetInt("rabbitmq.port"),
-	)
-	mqConn, err := rmq.NewConnectionManager(ctx, amqpURI, &amqp.Config{})
+	// Password must come from env var to avoid embedding credentials in URI.
+	rmqPassword := os.Getenv("RABBITMQ_PASSWORD")
+	if rmqPassword == "" {
+		log.Fatal().Msg("RABBITMQ_PASSWORD env var is required but not set")
+	}
+
+	rmqHost := viper.GetString("rabbitmq.host")
+	rmqPort := viper.GetInt("rabbitmq.port")
+	rmqUsername := viper.GetString("rabbitmq.username")
+	rmqVhost := viper.GetString("rabbitmq.vhost")
+	if rmqVhost == "" {
+		rmqVhost = "/"
+	}
+
+	// Build URI without credentials (host:port only).
+	amqpURI := fmt.Sprintf("amqp://%s:%d", rmqHost, rmqPort)
+
+	// Configure AMQP with SASL plain auth (credentials not in URI).
+	amqpConfig := amqp.Config{
+		SASL: []amqp.Authentication{
+			&amqp.PlainAuth{
+				Username: rmqUsername,
+				Password: rmqPassword,
+			},
+		},
+		Vhost: rmqVhost,
+	}
+
+	mqConn, err := rmq.NewConnectionManager(ctx, amqpURI, &amqpConfig)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to connect to RabbitMQ")
+		log.Fatal().Err(err).Msgf("failed to connect to RabbitMQ at %s/%s", rmqHost, rmqVhost)
 	}
 	defer mqConn.Close()
+	log.Info().Msgf("connected to RabbitMQ at %s:%d/%s", rmqHost, rmqPort, rmqVhost)
 
 	// Initialize publisher (with confirms).
 	pub, err := rmq.NewPublisher(mqConn)
@@ -205,6 +230,7 @@ func main() {
 		ClamdTCPAddr:            viper.GetString("clamd.tcp.addr"),
 		ClamdUnixPath:           viper.GetString("clamd.unix.path"),
 		MaxFileSizeBytes:        viper.GetInt64("scanner.maxFileSizeBytes"),
+		StaleFilesLogDir:        viper.GetString("scanner.staleFilesLogDir"),
 	}
 
 	// Validate TempNFSPrefix
@@ -245,24 +271,36 @@ func main() {
 	// Binds to 127.0.0.1 only — Kubernetes liveness/readiness probes reach it
 	// via localhost, and we avoid exposing version metadata on all interfaces.
 	healthPort := viper.GetInt("health.port")
+	healthAddr := fmt.Sprintf("127.0.0.1:%d", healthPort)
+
+	// Bind synchronously to detect port-in-use errors at startup.
+	healthListener, err := net.Listen("tcp", healthAddr)
+	if err != nil {
+		log.Fatal().Err(err).Str("addr", healthAddr).Msg("failed to bind health server port")
+	}
+
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{
+		if err := json.NewEncoder(w).Encode(map[string]string{
 			"status":    "ok",
 			"version":   Version,
 			"buildTime": BuildTime,
-		})
+		}); err != nil {
+			log.Error().Err(err).Msg("health encode failed")
+			http.Error(w, "internal", http.StatusInternalServerError)
+		}
 	})
 	healthSrv := &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", healthPort),
 		Handler: healthMux,
 	}
+
+	// Serve on the bound listener in a goroutine.
 	go func() {
-		log.Info().Str("addr", healthSrv.Addr).Msg("starting health check server")
-		if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error().Err(err).Msg("health check server failed")
+		log.Info().Str("addr", healthAddr).Msg("health check server started")
+		if err := healthSrv.Serve(healthListener); err != nil && err != http.ErrServerClosed {
+			log.Error().Err(err).Msg("health check server exited unexpectedly")
 		}
 	}()
 
