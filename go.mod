@@ -5,7 +5,7 @@ go 1.25.3
 require (
 	github.com/gabriel-vasile/mimetype v1.4.13
 	github.com/google/uuid v1.6.0
-	github.com/kubenetic/BunnyShepherd v0.0.0-20260409125247-c785203e8234
+	github.com/kubenetic/BunnyShepherd v0.0.0-20260504064122-089dd7c983f6
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/rs/zerolog v1.34.0
