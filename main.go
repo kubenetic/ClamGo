@@ -53,6 +53,7 @@ func init() {
 	viper.SetDefault("rabbitmq.host", "127.0.0.1")
 	viper.SetDefault("rabbitmq.port", 5672)
 	viper.SetDefault("rabbitmq.username", "")
+	viper.SetDefault("rabbitmq.password", "")
 	viper.SetDefault("rabbitmq.vhost", "/")
 	viper.SetDefault("rabbitmq.exchange", "uploader.exchange")
 	viper.SetDefault("rabbitmq.dlx", "uploader.dlx")
@@ -121,10 +122,11 @@ func main() {
 	defer cancel()
 
 	// Initialize RabbitMQ connection manager.
-	// Password must come from env var to avoid embedding credentials in URI.
-	rmqPassword := os.Getenv("RABBITMQ_PASSWORD")
+	// Password is read through Viper (CLAMGO_RABBITMQ_PASSWORD env var) — consistent
+	// with all other config. Credentials are passed via SASL PlainAuth, not embedded in the URI.
+	rmqPassword := viper.GetString("rabbitmq.password")
 	if rmqPassword == "" {
-		log.Fatal().Msg("RABBITMQ_PASSWORD env var is required but not set")
+		log.Fatal().Msg("rabbitmq.password (CLAMGO_RABBITMQ_PASSWORD) is required but not set")
 	}
 
 	rmqHost := viper.GetString("rabbitmq.host")
