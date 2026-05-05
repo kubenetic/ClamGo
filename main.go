@@ -270,10 +270,10 @@ func main() {
 	cancelQueue := viper.GetString("rabbitmq.cancelQueue")
 
 	// Start health check HTTP server.
-	// Binds to 127.0.0.1 only — Kubernetes liveness/readiness probes reach it
-	// via localhost, and we avoid exposing version metadata on all interfaces.
+	// Binds to all interfaces so that Istio's pilot-agent can forward
+	// liveness/readiness probes from the pod IP to this endpoint.
 	healthPort := viper.GetInt("health.port")
-	healthAddr := fmt.Sprintf("127.0.0.1:%d", healthPort)
+	healthAddr := fmt.Sprintf(":%d", healthPort)
 
 	// Bind synchronously to detect port-in-use errors at startup.
 	healthListener, err := net.Listen("tcp", healthAddr)
