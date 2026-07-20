@@ -1,4 +1,5 @@
+# Build context is uploader/ (parent of ClamGo/).
 # Exclude the reference config so it is not baked into the image.
 # The actual config must be provided at runtime (e.g. via a Kubernetes ConfigMap
 # mounted at /etc/clamgo/config.yaml).
-configs/config.yaml
+ClamGo/configs/config.yaml
