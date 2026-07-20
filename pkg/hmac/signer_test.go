@@ -1,6 +1,8 @@
 package hmac
 
 import (
+	cryptohmac "crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"testing"
@@ -143,4 +145,53 @@ func findKeyIndex(s, key string) int {
 		}
 	}
 	return -1
+}
+
+// ─── Known-Answer Test (C-1) ───────────────────────────────────────────────────
+//
+// This test asserts cross-language agreement with the Java backend.
+// The key, payload, and expected signature are fixed constants that MUST match
+// the Java-side verification logic exactly.
+//
+//	key_base64 = MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+//	             (decodes to ASCII "0123456789abcdef0123456789abcdef")
+//
+//	payload bytes (exact) = {"caseId":"c1","fileId":"f1","scannedAt":"2026-01-01T00:00:00Z","verdict":"CLEAN"}
+//	expected sig.value (base64) = 4B/YIqyBDlkBLULhMrjqpwaGyQj2sptDU2xWkflVusQ=
+func TestKnownAnswer_CrossLanguageHMAC(t *testing.T) {
+	const (
+		keyB64         = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+		payloadStr     = `{"caseId":"c1","fileId":"f1","scannedAt":"2026-01-01T00:00:00Z","verdict":"CLEAN"}`
+		expectedSigB64 = "4B/YIqyBDlkBLULhMrjqpwaGyQj2sptDU2xWkflVusQ="
+	)
+
+	// Decode the key.
+	keyBytes, err := base64.StdEncoding.DecodeString(keyB64)
+	require.NoError(t, err, "key must be valid base64")
+	require.Len(t, keyBytes, 32, "key must be 32 bytes")
+
+	// Verify that the key decodes to the expected ASCII string.
+	assert.Equal(t, "0123456789abcdef0123456789abcdef", string(keyBytes))
+
+	// Build a SignedEnvelope with the exact payload bytes (no re-serialisation).
+	env := &SignedEnvelope{
+		Payload: json.RawMessage(payloadStr),
+		Sig: Sig{
+			Alg:   AlgHMACSHA256,
+			KeyID: KeyIDV1,
+			Nonce: "test-nonce",
+			Value: expectedSigB64,
+		},
+	}
+
+	// Verify() must accept this envelope.
+	err = Verify(keyBytes, env)
+	require.NoError(t, err, "Verify must accept the known-answer envelope")
+
+	// Also assert that computing HMAC over the exact payload bytes yields the expected tag.
+	// This is the same computation the Java backend performs.
+	mac := cryptohmac.New(sha256.New, keyBytes)
+	mac.Write([]byte(payloadStr))
+	gotSig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	assert.Equal(t, expectedSigB64, gotSig, "HMAC over exact payload bytes must match expected tag")
 }

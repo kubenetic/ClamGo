@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -13,10 +16,10 @@ import (
 	"syscall"
 	"time"
 
+	"ClamGo/pkg/hmac"
 	"ClamGo/pkg/scanner"
 
 	rmq "github.com/kubenetic/BunnyShepherd/pkg/rabbitmq"
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -67,17 +70,32 @@ func init() {
 	viper.SetDefault("rabbitmq.scanHandlerTimeoutSeconds", 600)
 	viper.SetDefault("rabbitmq.cancelPrefetchCount", 10)
 
+	// RabbitMQ TLS — mirrors tusd-token-hook pattern.
+	// CLAMGO_RABBITMQ_SCHEME: "amqp" (default) or "amqps"
+	// CLAMGO_RABBITMQ_TLS_CAFILE: path to PEM CA bundle (optional, amqps only)
+	// CLAMGO_RABBITMQ_TLS_INSECURESKIPVERIFY: disable cert verification (dev only)
+	viper.SetDefault("rabbitmq.scheme", "amqp")
+	viper.SetDefault("rabbitmq.tls.caFile", "")
+	viper.SetDefault("rabbitmq.tls.insecureSkipVerify", false)
+
 	// Redis
 	viper.SetDefault("redis.enabled", false)
 	viper.SetDefault("redis.addr", "127.0.0.1:6379")
 	viper.SetDefault("redis.password", "")
 	viper.SetDefault("redis.db", 0)
+	viper.SetDefault("redis.tls.enabled", false) // F-13: optional TLS for Redis
 
 	// Redis Cluster
 	viper.SetDefault("redis.cluster.enabled", false)
 	viper.SetDefault("redis.cluster.nodes", []string{"redis-0:6379", "redis-1:6379", "redis-2:6379"})
 	viper.SetDefault("redis.cluster.password", "")
 	viper.SetDefault("redis.cluster.maxRedirects", 10)
+
+	// HMAC signing (C-1/F-2)
+	// CLAMGO_HMAC_KEY: base64-encoded 32-byte key. Empty = unsigned mode (SBX).
+	// CLAMGO_HMAC_KEYID: key identifier included in the sig envelope.
+	viper.SetDefault("hmac.key", "")
+	viper.SetDefault("hmac.keyId", hmac.KeyIDV1)
 
 	// Temp NFS
 	viper.SetDefault("tempNFS.prefix", "/mnt/temp-nfs/")
@@ -137,26 +155,59 @@ func main() {
 		rmqVhost = "/"
 	}
 
-	// Build URI without credentials (host:port only).
-	amqpURI := fmt.Sprintf("amqp://%s:%d", rmqHost, rmqPort)
-
-	// Configure AMQP with SASL plain auth (credentials not in URI).
-	amqpConfig := amqp.Config{
-		SASL: []amqp.Authentication{
-			&amqp.PlainAuth{
-				Username: rmqUsername,
-				Password: rmqPassword,
-			},
-		},
-		Vhost: rmqVhost,
+	// ── RabbitMQ scheme + TLS (mirrors tusd-token-hook) ──────────────────────
+	// CLAMGO_RABBITMQ_SCHEME must be "amqp" or "amqps".
+	// When "amqps", a *tls.Config is built (MinVersion TLS 1.2).
+	// CLAMGO_RABBITMQ_TLS_CAFILE loads a custom CA bundle (optional).
+	// CLAMGO_RABBITMQ_TLS_INSECURESKIPVERIFY disables cert verification (dev only).
+	mqScheme := viper.GetString("rabbitmq.scheme")
+	if mqScheme != "amqp" && mqScheme != "amqps" {
+		log.Fatal().Str("scheme", mqScheme).Msg("rabbitmq.scheme must be 'amqp' or 'amqps'")
 	}
 
-	mqConn, err := rmq.NewConnectionManager(ctx, amqpURI, &amqpConfig)
+	var tlsCfgForMQ *tls.Config
+	if mqScheme == "amqps" {
+		mqCAFile := viper.GetString("rabbitmq.tls.caFile")
+		mqSkipVerify := viper.GetBool("rabbitmq.tls.insecureSkipVerify")
+
+		tlsCfgForMQ = &tls.Config{MinVersion: tls.VersionTLS12}
+
+		if mqCAFile != "" {
+			pem, err := os.ReadFile(mqCAFile)
+			if err != nil {
+				log.Fatal().Err(err).Str("file", mqCAFile).Msg("failed to read rabbitmq.tls.caFile")
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				log.Fatal().Str("file", mqCAFile).Msg("no valid certs found in rabbitmq.tls.caFile")
+			}
+			tlsCfgForMQ.RootCAs = pool
+		}
+
+		if mqSkipVerify {
+			log.Warn().Msg("rabbitmq TLS verification DISABLED (rabbitmq.tls.insecureSkipVerify=true) — dev use only")
+			tlsCfgForMQ.InsecureSkipVerify = true //nolint:gosec // intentional dev-only flag
+		}
+	}
+
+	// NewConnectionManagerFromCredentials passes credentials via SASL PlainAuth,
+	// bypassing URL parsing entirely — safe for passwords containing URL-special
+	// characters such as %, ?, <, >, (, ), !.
+	mqConn, err := rmq.NewConnectionManagerFromCredentials(
+		ctx,
+		mqScheme,
+		rmqUsername,
+		rmqPassword,
+		rmqHost,
+		rmqPort,
+		rmqVhost,
+		tlsCfgForMQ,
+	)
 	if err != nil {
 		log.Fatal().Err(err).Msgf("failed to connect to RabbitMQ at %s/%s", rmqHost, rmqVhost)
 	}
 	defer mqConn.Close()
-	log.Info().Msgf("connected to RabbitMQ at %s:%d/%s", rmqHost, rmqPort, rmqVhost)
+	log.Info().Msgf("connected to RabbitMQ at %s:%s:%d/%s", mqScheme, rmqHost, rmqPort, rmqVhost)
 
 	// Initialize publisher (with confirms).
 	pub, err := rmq.NewPublisher(mqConn)
@@ -189,11 +240,17 @@ func main() {
 			// Single node mode (backward compatibility)
 			redisAddr := viper.GetString("redis.addr")
 			if redisAddr != "" {
-				redisClient = redis.NewClient(&redis.Options{
+				opts := &redis.Options{
 					Addr:     redisAddr,
 					Password: viper.GetString("redis.password"),
 					DB:       viper.GetInt("redis.db"),
-				})
+				}
+				// F-13: optional TLS for Redis single-node.
+				if viper.GetBool("redis.tls.enabled") {
+					opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+					log.Info().Str("addr", redisAddr).Msg("Redis TLS enabled")
+				}
+				redisClient = redis.NewClient(opts)
 
 				log.Info().
 					Str("addr", redisAddr).
@@ -247,6 +304,27 @@ func main() {
 	}
 
 	s := scanner.New(scannerCfg, pub, redisClient)
+
+	// C-1/F-2: Initialise HMAC signer from environment.
+	// CLAMGO_HMAC_KEY must be a base64-encoded 32-byte key.
+	// When absent, ClamGo publishes unsigned messages (SBX compatibility).
+	hmacKeyB64 := viper.GetString("hmac.key")
+	if hmacKeyB64 != "" {
+		keyBytes, err := base64.StdEncoding.DecodeString(hmacKeyB64)
+		if err != nil {
+			log.Fatal().Err(err).Msg("CLAMGO_HMAC_KEY is not valid base64")
+		}
+		keyID := viper.GetString("hmac.keyId")
+		signer, err := hmac.NewSigner(keyBytes, keyID)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to create HMAC signer (key must be exactly 32 bytes)")
+		}
+		s.WithSigner(signer)
+		log.Info().Str("keyId", keyID).Msg("HMAC signing ENABLED — scan results will be signed")
+	} else {
+		log.Info().Msg("HMAC signing DISABLED (CLAMGO_HMAC_KEY not set) — publishing unsigned messages")
+	}
+
 	s.StartCleanup(ctx)
 
 	// Build consumers (prefetch=1 for both: process one message at a time).
@@ -295,7 +373,11 @@ func main() {
 		}
 	})
 	healthSrv := &http.Server{
-		Handler: healthMux,
+		Handler:           healthMux,
+		ReadHeaderTimeout: 5 * time.Second, // F-9: prevent Slowloris
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Serve on the bound listener in a goroutine.

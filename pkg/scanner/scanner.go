@@ -2,9 +2,9 @@
 //   - Cancellation pre-check (Redis + in-memory set)
 //   - Magic byte inspection (actual MIME type detection)
 //   - SHA-256 checksum computation
-//   - ClamAV scan via clamd
+//   - ClamAV scan via clamd INSTREAM (eliminates TOCTOU race)
 //   - Post-scan cancellation check
-//   - Result publication (file.scan.completed)
+//   - Result publication (file.scan.completed), optionally HMAC-signed
 //   - Retry routing (file.scan.retrying → retry queues; file.scan.failed → DLQ)
 package scanner
 
@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"ClamGo/pkg/hmac"
 	"ClamGo/pkg/model"
 	"ClamGo/pkg/service/clamd"
 
@@ -61,6 +62,10 @@ const (
 	// maxCancelledEntries is the maximum number of entries in the cancelled map.
 	// Prevents unbounded memory growth from a flood of cancellation messages.
 	maxCancelledEntries = 100_000
+
+	// cancelRateLimit is the maximum number of cancel messages processed per second.
+	// Protects against cancellation-flood attacks (F-4).
+	cancelRateLimit = 100
 )
 
 // clamVersionRe parses clamd's VERSION response.
@@ -168,23 +173,40 @@ type Scanner struct {
 	cfg              Config
 	pub              *rmq.Publisher
 	redis            redis.UniversalClient
+	signer           *hmac.Signer // nil when HMAC signing is disabled
 	cancelMu         sync.RWMutex
 	cancelledCurrent map[string]cancelledEntry // current generation of cancelled caseIds
 	cancelledPrev    map[string]cancelledEntry // previous generation (for LRU eviction)
+	// cancelTokens is a simple token-bucket for rate-limiting cancel messages (F-4).
+	// It is refilled by a background goroutine at cancelRateLimit tokens/second.
+	cancelTokens chan struct{}
 }
 
 // New creates a Scanner. The publisher must already be initialized.
 // A background goroutine is started to evict stale cancelled entries; it stops
 // when ctx is cancelled.
+// signer may be nil — when nil, messages are published unsigned (SBX mode).
 func New(cfg Config, pub *rmq.Publisher, redisClient redis.UniversalClient) *Scanner {
+	// Pre-fill the token bucket to capacity.
+	tokens := make(chan struct{}, cancelRateLimit)
+	for i := 0; i < cancelRateLimit; i++ {
+		tokens <- struct{}{}
+	}
 	s := &Scanner{
 		cfg:              cfg,
 		pub:              pub,
 		redis:            redisClient,
 		cancelledCurrent: make(map[string]cancelledEntry),
 		cancelledPrev:    make(map[string]cancelledEntry),
+		cancelTokens:     tokens,
 	}
 	return s
+}
+
+// WithSigner attaches an HMAC signer to the scanner. Call this after New()
+// when CLAMGO_HMAC_KEY is configured.
+func (s *Scanner) WithSigner(signer *hmac.Signer) {
+	s.signer = signer
 }
 
 // StartCleanup starts the background goroutine that evicts cancelled entries
@@ -194,12 +216,24 @@ func (s *Scanner) StartCleanup(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(cancelledCleanupInterval)
 		defer ticker.Stop()
+		// Refill the cancel rate-limit token bucket at cancelRateLimit tokens/second.
+		refillTicker := time.NewTicker(time.Second)
+		defer refillTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				s.evictStaleCancelled()
+			case <-refillTicker.C:
+				// Refill up to capacity without blocking.
+				for i := 0; i < cancelRateLimit; i++ {
+					select {
+					case s.cancelTokens <- struct{}{}:
+					default:
+						// bucket full
+					}
+				}
 			}
 		}
 	}()
@@ -232,7 +266,20 @@ func (s *Scanner) evictStaleCancelled() {
 // Called by the case.cancelled consumer goroutine.
 // Uses a two-generation LRU approach: when the current generation reaches capacity,
 // it is swapped with the previous generation (evicting the oldest entries).
+// Rate-limited to cancelRateLimit messages/second to prevent cancellation-flood attacks (F-4).
 func (s *Scanner) MarkCancelled(caseId string) {
+	// Consume one token from the rate-limit bucket (non-blocking).
+	// If the bucket is empty, the message is still processed but a warning is logged.
+	select {
+	case <-s.cancelTokens:
+		// token consumed — within rate limit
+	default:
+		log.Warn().
+			Str("caseId", caseId).
+			Int("rateLimit", cancelRateLimit).
+			Msg("cancel rate limit exceeded; possible cancellation-flood attack")
+	}
+
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
 
@@ -244,10 +291,11 @@ func (s *Scanner) MarkCancelled(caseId string) {
 
 	// If current generation is at capacity, swap generations (evict oldest).
 	if len(s.cancelledCurrent) >= maxCancelledEntries {
-		log.Warn().
+		log.Error().
 			Int("currentSize", len(s.cancelledCurrent)).
 			Int("prevSize", len(s.cancelledPrev)).
-			Msg("cancelled entries current generation at capacity; swapping generations")
+			Int("maxEntries", maxCancelledEntries).
+			Msg("SECURITY: cancelled entries current generation at capacity; swapping generations — possible cancellation-flood attack")
 		s.cancelledPrev = s.cancelledCurrent
 		s.cancelledCurrent = make(map[string]cancelledEntry)
 	}
@@ -452,6 +500,13 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		ackLogErr(d)
 		return nil
 	}
+	// F-7: reject directory paths immediately — do not retry.
+	if fi.IsDir() {
+		log.Error().Str("tempPath", msg.TempPath).Msg("path is a directory; rejecting (ACK without scan)")
+		_ = s.publishRejection(ctx, msg, "PATH_IS_DIRECTORY")
+		ackLogErr(d)
+		return nil
+	}
 
 	// Check file size limit from message metadata (fast path).
 	if s.cfg.MaxFileSizeBytes > 0 && msg.SizeBytes > s.cfg.MaxFileSizeBytes {
@@ -530,43 +585,48 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	// Compute SHA-256 and magic bytes in one pass.
 	sha256hex, magicAnalysis, mimeErr := computeChecksumAndMagicBytes(f, msg.OriginalName, msg.ContentType)
 	if mimeErr != nil {
+		f.Close()
 		log.Error().Err(mimeErr).Msg("magic byte detection failed; treating as scan error")
-		return s.handleScanFailure(ctx, d, msg, retryCount, "MAGIC_BYTE_ERROR", mimeErr.Error(), d.Headers)
+		return s.handleScanFailure(ctx, d, msg, retryCount, "MAGIC_BYTE_ERROR", "magic byte detection failed", d.Headers)
 	}
-
-	// Close file once reading is done; clamd reads by path.
-	f.Close()
 
 	// Post-rewind cancellation check.
 	if s.isCancelled(ctx, msg.CaseId) {
+		f.Close()
+		// F-5: delete temp file before ACK on mid-read cancellation.
+		s.removeFileWithRetry(msg.TempPath)
 		log.Info().Msg("case cancelled during file read; discarding scan job (ACK)")
 		ackLogErr(d)
 		return nil
 	}
 
-	// Connect to clamd and scan.
-	clamClient, err := s.newClamdClient()
-	if err != nil {
-		log.Error().Err(err).Msg("failed to connect to clamd")
-		return s.handleScanFailure(ctx, d, msg, retryCount, "CLAMD_UNAVAILABLE", err.Error(), d.Headers)
+	// Seek back to the beginning so we can stream the same bytes to clamd via INSTREAM.
+	// This eliminates the TOCTOU race between checksum computation and the scan (F-3).
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		log.Error().Err(err).Msg("failed to seek file for INSTREAM scan")
+		return s.handleScanFailure(ctx, d, msg, retryCount, "FILE_SEEK_ERROR", "failed to seek file for scan", d.Headers)
 	}
 
-	finding, err := clamClient.ScanFile(msg.TempPath)
+	// Connect to clamd and scan via INSTREAM (streams the open fd — no re-open race).
+	clamClient, err := s.newClamdClient()
+	if err != nil {
+		f.Close()
+		log.Error().Str("clamdAddr", s.cfg.ClamdTCPAddr).Msg("failed to connect to clamd")
+		return s.handleScanFailure(ctx, d, msg, retryCount, "CLAMD_UNAVAILABLE", "clamd connection failed", d.Headers)
+	}
+
+	finding, err := clamClient.ScanStream(f)
+	f.Close()
 	clamClient.Close() // Close scan connection immediately after use
 	scanDuration := time.Since(start)
 	if err != nil {
-		if err == clamd.ErrFileNotFound {
-			log.Error().Err(err).Str("tempPath", msg.TempPath).Msg("clamd could not find file; discarding (ACK)")
-			ackLogErr(d)
-			return nil
-		}
-		// Check if this is a clamd scan error (transient failure, should retry).
 		if errors.Is(err, clamd.ErrClamdScanError) {
-			log.Error().Err(err).Msg("clamd scan error; scheduling retry")
-			return s.handleScanFailure(ctx, d, msg, retryCount, "CLAMD_SCAN_ERROR", err.Error(), d.Headers)
+			log.Error().Msg("clamd scan error; scheduling retry")
+			return s.handleScanFailure(ctx, d, msg, retryCount, "CLAMD_SCAN_ERROR", "clamd scan error", d.Headers)
 		}
-		log.Error().Err(err).Msg("clamd scan error")
-		return s.handleScanFailure(ctx, d, msg, retryCount, "SCAN_ERROR", err.Error(), d.Headers)
+		log.Error().Msg("clamd scan error")
+		return s.handleScanFailure(ctx, d, msg, retryCount, "SCAN_ERROR", "scan error", d.Headers)
 	}
 
 	// Get engine and signature versions on a separate connection (best effort).
@@ -581,10 +641,14 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 	}
 
 	// Build and publish the scan completed message.
+	// SECURITY (C-2): only an explicit "OK" finding is clean.
+	// An empty finding or any other value must NOT become VerdictClean —
+	// parseScanResponse already returns an error for those cases, so by the
+	// time we reach here, finding is either "OK" or a malware name.
 	var verdict model.Verdict
 	var threatName string
 
-	if finding == "OK" || finding == "" {
+	if finding == "OK" {
 		verdict = model.VerdictClean
 	} else {
 		verdict = model.VerdictInfected
@@ -607,12 +671,8 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 		ScanDurationMs:    scanDuration.Milliseconds(),
 	}
 
-	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{
-		Payload: result,
-		Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanCompleted},
-	}
 	pubCtx, pubCancel := publishCtx(ctx, 15*time.Second)
-	if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope); err != nil {
+	if err := s.publishScanCompleted(pubCtx, result); err != nil {
 		log.Error().Err(err).Msg("failed to publish ScanCompletedMessage; NACKing original (transient failure, will requeue)")
 		pubCancel()
 		nackLogErr(d, true)
@@ -646,6 +706,16 @@ func (s *Scanner) handleScanFailure(
 		// Route to retry queue.
 		queueName := retryQueueNames[nextRetry]
 		delayMs := retryDelayMs[nextRetry]
+
+		// F-8: if the target retry queue name is empty, route to DLQ instead.
+		if queueName == "" {
+			log.Error().
+				Int("nextRetry", nextRetry).
+				Str("fileId", msg.FileId).
+				Msg("retry queue name is empty; routing to DLQ instead")
+			// Fall through to the DLQ path below by setting retryCount = maxRetries.
+			goto dlqPath
+		}
 
 		// Build headers for the retry message.
 		firstFailureAt := extractStringHeader(origHeaders, headerFirstFailureAt)
@@ -717,6 +787,7 @@ func (s *Scanner) handleScanFailure(
 		return nil
 	}
 
+dlqPath:
 	// Retries exhausted — publish to DLX.
 	failedMsg := model.ScanFailedMessage{
 		MessageId:       model.NewMessageId(),
@@ -752,6 +823,43 @@ func (s *Scanner) handleScanFailure(
 
 	ackLogErr(d)
 	return nil
+}
+
+// publishScanCompleted publishes a ScanCompletedMessage to the exchange.
+// When a Signer is configured, the message body is wrapped in a SignedEnvelope
+// (HMAC-SHA256 over the canonical JSON payload). The __TypeId__ AMQP header is
+// always set to "FileScanCompletedMessage" so the Java backend can dispatch
+// correctly regardless of whether the envelope is signed.
+//
+// The bytes placed in SignedEnvelope.Payload are the EXACT bytes that were
+// HMAC-signed — no re-serialisation occurs between signing and publishing.
+func (s *Scanner) publishScanCompleted(ctx context.Context, result model.ScanCompletedMessage) error {
+	headers := amqp.Table{"__TypeId__": model.TypeIdFileScanCompleted}
+
+	if s.signer != nil {
+		env, err := s.signer.Sign(result)
+		if err != nil {
+			return fmt.Errorf("HMAC sign: %w", err)
+		}
+		// Publish the SignedEnvelope as the message body.
+		// The payload field contains the exact canonical bytes that were signed.
+		envBytes, err := json.Marshal(env)
+		if err != nil {
+			return fmt.Errorf("marshal SignedEnvelope: %w", err)
+		}
+		rawEnvelope := &mqmodel.JSONMessage[json.RawMessage]{
+			Payload: json.RawMessage(envBytes),
+			Headers: headers,
+		}
+		return s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, rawEnvelope)
+	}
+
+	// Unsigned path (SBX / no key configured).
+	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{
+		Payload: result,
+		Headers: headers,
+	}
+	return s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope)
 }
 
 // newClamdClient creates a new ClamClient connection using the configured protocol.
@@ -956,6 +1064,7 @@ func extToMime(ext string) string {
 
 // extractRetryCount reads the x-retry-count integer header from AMQP headers.
 // Returns 0 if the header is absent or cannot be parsed.
+// Negative values are clamped to 0 (F-8).
 // For float64 values, bounds-checks against math.MaxInt to prevent overflow.
 func extractRetryCount(headers amqp.Table) int {
 	if headers == nil {
@@ -965,17 +1074,18 @@ func extractRetryCount(headers amqp.Table) int {
 	if !ok {
 		return 0
 	}
+	var result int
 	switch val := v.(type) {
 	case int64:
 		if val > math.MaxInt || val < math.MinInt {
 			log.Warn().Int64("value", val).Msg("retry count out of bounds")
 			return 0
 		}
-		return int(val)
+		result = int(val)
 	case int32:
-		return int(val)
+		result = int(val)
 	case int:
-		return val
+		result = val
 	case float64:
 		// Bounds-check float64 before casting to int to prevent overflow/precision loss.
 		if val > float64(math.MaxInt) || val < float64(math.MinInt) || math.IsNaN(val) || math.IsInf(val, 0) {
@@ -987,9 +1097,16 @@ func extractRetryCount(headers amqp.Table) int {
 			log.Warn().Float64("value", val).Msg("retry count is not an integer")
 			return 0
 		}
-		return int(val)
+		result = int(val)
+	default:
+		return 0
 	}
-	return 0
+	// F-8: guard negative values.
+	if result < 0 {
+		log.Warn().Int("value", result).Msg("retry count is negative; clamping to 0")
+		return 0
+	}
+	return result
 }
 
 // extractStringHeader reads a string header value from AMQP headers.
@@ -1029,15 +1146,10 @@ func (s *Scanner) publishRejection(ctx context.Context, msg model.FileUploadedMe
 		ScannedAt:      time.Now().UTC(),
 		ScanDurationMs: 0,
 	}
-	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{
-		Payload: result,
-		Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanCompleted},
-	}
 	pubCtx, cancel := publishCtx(ctx, 15*time.Second)
 	defer cancel()
-	if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope); err != nil {
+	if err := s.publishScanCompleted(pubCtx, result); err != nil {
 		log.Error().
-			Err(err).
 			Str("fileId", msg.FileId).
 			Str("caseId", msg.CaseId).
 			Str("reason", reason).

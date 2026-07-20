@@ -1,49 +1,61 @@
 package clamd
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 
 	"ClamGo/pkg/model"
 )
 
+// instreamChunkSize is the chunk size used when streaming file content to clamd via INSTREAM.
+// clamd's default StreamMaxLength is 25 MB; we use 4 KB chunks for efficient I/O.
+const instreamChunkSize = 4096
+
 var (
 	ErrFileNotFound   = errors.New("file not found")
 	ErrClamdScanError = errors.New("clamd scan error")
 )
 
-// parseScanResponse parses clamd scan response lines and returns:
-//   - "OK" if the line ends with " OK"
-//   - the malware name if the line ends with " FOUND"
-//   - the full line if it ends with " ERROR"
-//   - "" otherwise
-func parseScanResponse(line string) string {
+// parseScanResponse parses a single clamd scan response line and returns:
+//   - ("OK", nil)          — line ends with " OK" (clean)
+//   - (malwareName, nil)   — line ends with " FOUND" and contains ": " separator
+//   - (line, ErrClamdScanError) — line ends with " ERROR"
+//   - ("", ErrClamdScanError)  — empty/blank line, "RELOAD", FOUND without ": ",
+//     or any other unrecognised response
+//
+// SECURITY: an unrecognised or empty response MUST NOT be treated as clean.
+// Only an explicit " OK" suffix yields VerdictClean.
+func parseScanResponse(line string) (string, error) {
 	line = strings.TrimSpace(line)
 	if line == "" {
-		return ""
+		return "", fmt.Errorf("%w: empty response from clamd", ErrClamdScanError)
 	}
 
 	if strings.HasSuffix(line, " ERROR") {
-		return line
+		return line, ErrClamdScanError
 	}
 
 	if strings.HasSuffix(line, " FOUND") {
 		// Extract malware name: substring between the LAST ": " and " FOUND"
 		lastColon := strings.LastIndex(line, ": ")
-		if lastColon >= 0 {
-			malwareName := line[lastColon+2 : len(line)-6] // -6 for " FOUND"
-			return malwareName
+		if lastColon < 0 {
+			// Malformed FOUND line — no ": " separator; treat as scan error.
+			return "", fmt.Errorf("%w: malformed FOUND response (no ': ' separator): %s", ErrClamdScanError, line)
 		}
-		return ""
+		malwareName := line[lastColon+2 : len(line)-6] // -6 for " FOUND"
+		return malwareName, nil
 	}
 
 	if strings.HasSuffix(line, " OK") {
-		return "OK"
+		return "OK", nil
 	}
 
-	return ""
+	// Anything else (e.g. "RELOAD", unknown protocol message) is an error.
+	return "", fmt.Errorf("%w: unrecognised clamd response: %s", ErrClamdScanError, line)
 }
 
 func (client *ClamClient) ScanFile(filePath string) (string, error) {
@@ -65,7 +77,7 @@ func (client *ClamClient) ScanFile(filePath string) (string, error) {
 		return "", fmt.Errorf("error reading response from clamd: %w", err)
 	}
 
-	finding := parseScanResponse(string(response))
+	finding, parseErr := parseScanResponse(string(response))
 
 	// clamd prefixes ERROR responses with the scanned path, e.g.
 	//   "/mnt/temp-nfs/abc: File path check failure: No such file or directory. ERROR"
@@ -74,10 +86,71 @@ func (client *ClamClient) ScanFile(filePath string) (string, error) {
 		return "", ErrFileNotFound
 	}
 
-	// Detect ERROR responses (but not the file-not-found case handled above).
-	// ERROR responses end with " ERROR" and indicate transient failures.
-	if strings.HasSuffix(finding, " ERROR") {
-		return "", fmt.Errorf("%w: %s", ErrClamdScanError, finding)
+	if parseErr != nil {
+		return "", parseErr
+	}
+
+	return finding, nil
+}
+
+// ScanStream sends file content to clamd using the INSTREAM command, which
+// streams the file bytes over the existing socket connection. This eliminates
+// the TOCTOU race between checksum computation and the path-based SCAN command
+// because the same open file descriptor is used for both operations.
+//
+// Protocol: "nINSTREAM\n" followed by chunks of the form:
+//
+//	[4-byte big-endian length][data bytes]
+//
+// Terminated by a zero-length chunk: [0x00 0x00 0x00 0x00].
+// clamd responds with "stream: OK\n" or "stream: <malware> FOUND\n" or an ERROR line.
+func (client *ClamClient) ScanStream(r io.Reader) (string, error) {
+	if client.connection == nil {
+		return "", fmt.Errorf("connection is nil")
+	}
+
+	// Send INSTREAM command.
+	if err := client.write([]byte("nINSTREAM\n")); err != nil {
+		return "", fmt.Errorf("error sending INSTREAM command: %w", err)
+	}
+
+	// Stream file content in chunks.
+	buf := make([]byte, instreamChunkSize)
+	for {
+		n, readErr := r.Read(buf)
+		if n > 0 {
+			// Write 4-byte big-endian length prefix.
+			var lenBuf [4]byte
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(n))
+			if _, err := client.connection.Write(lenBuf[:]); err != nil {
+				return "", fmt.Errorf("error writing chunk length: %w", err)
+			}
+			if _, err := client.connection.Write(buf[:n]); err != nil {
+				return "", fmt.Errorf("error writing chunk data: %w", err)
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return "", fmt.Errorf("error reading file for INSTREAM: %w", readErr)
+		}
+	}
+
+	// Send zero-length terminator chunk.
+	if _, err := client.connection.Write([]byte{0, 0, 0, 0}); err != nil {
+		return "", fmt.Errorf("error sending INSTREAM terminator: %w", err)
+	}
+
+	// Read clamd response.
+	response, err := client.read()
+	if err != nil {
+		return "", fmt.Errorf("error reading INSTREAM response from clamd: %w", err)
+	}
+
+	finding, parseErr := parseScanResponse(string(response))
+	if parseErr != nil {
+		return "", parseErr
 	}
 
 	return finding, nil

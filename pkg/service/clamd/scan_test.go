@@ -2,6 +2,8 @@ package clamd
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -9,6 +11,8 @@ import (
 	"testing"
 	"time"
 )
+
+// ─── parseScanResponse unit tests ──────────────────────────────────────────────
 
 func TestParseScanResponse_OK(t *testing.T) {
 	tests := []struct {
@@ -22,7 +26,10 @@ func TestParseScanResponse_OK(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result := parseScanResponse(tt.input)
+			result, err := parseScanResponse(tt.input)
+			if err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -42,7 +49,10 @@ func TestParseScanResponse_FOUND(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result := parseScanResponse(tt.input)
+			result, err := parseScanResponse(tt.input)
+			if err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -52,12 +62,17 @@ func TestParseScanResponse_FOUND(t *testing.T) {
 
 func TestParseScanResponse_ERROR(t *testing.T) {
 	input := "/scandir/x: File path check failure: No such file or directory. ERROR"
-	result := parseScanResponse(input)
+	result, err := parseScanResponse(input)
+	if !errors.Is(err, ErrClamdScanError) {
+		t.Errorf("expected ErrClamdScanError, got %v", err)
+	}
 	if result != input {
 		t.Errorf("expected full error line %q, got %q", input, result)
 	}
 }
 
+// TestParseScanResponse_Empty verifies that empty/blank responses are treated as
+// scan errors, NOT as clean (C-2/F-1 security fix).
 func TestParseScanResponse_Empty(t *testing.T) {
 	tests := []string{
 		"",
@@ -66,10 +81,47 @@ func TestParseScanResponse_Empty(t *testing.T) {
 	}
 
 	for _, input := range tests {
-		t.Run("empty", func(t *testing.T) {
-			result := parseScanResponse(input)
-			if result != "" {
-				t.Errorf("expected empty string, got %q", result)
+		t.Run("empty:"+input, func(t *testing.T) {
+			result, err := parseScanResponse(input)
+			if !errors.Is(err, ErrClamdScanError) {
+				t.Errorf("expected ErrClamdScanError for empty input, got err=%v result=%q", err, result)
+			}
+		})
+	}
+}
+
+// TestParseScanResponse_RELOAD verifies that a "RELOAD" response is treated as
+// a scan error, NOT as clean (C-2/F-1 security fix).
+func TestParseScanResponse_RELOAD(t *testing.T) {
+	result, err := parseScanResponse("RELOAD")
+	if !errors.Is(err, ErrClamdScanError) {
+		t.Errorf("expected ErrClamdScanError for RELOAD, got err=%v result=%q", err, result)
+	}
+}
+
+// TestParseScanResponse_FOUNDWithoutColon verifies that a FOUND line without
+// the ": " separator is treated as a scan error, NOT as clean (C-2/F-1 security fix).
+func TestParseScanResponse_FOUNDWithoutColon(t *testing.T) {
+	// "/x FOUND" has no ": " separator — must be an error, not clean.
+	result, err := parseScanResponse("/x FOUND")
+	if !errors.Is(err, ErrClamdScanError) {
+		t.Errorf("expected ErrClamdScanError for FOUND without ': ', got err=%v result=%q", err, result)
+	}
+}
+
+// TestParseScanResponse_UnknownResponse verifies that any unrecognised response
+// is treated as a scan error, NOT as clean (C-2/F-1 security fix).
+func TestParseScanResponse_UnknownResponse(t *testing.T) {
+	unknowns := []string{
+		"some random text",
+		"PONG",
+		"ClamAV 1.4.1/27450/Wed Feb 26 08:15:00 2026",
+	}
+	for _, input := range unknowns {
+		t.Run(input, func(t *testing.T) {
+			result, err := parseScanResponse(input)
+			if !errors.Is(err, ErrClamdScanError) {
+				t.Errorf("expected ErrClamdScanError for unknown response %q, got err=%v result=%q", input, err, result)
 			}
 		})
 	}
@@ -79,11 +131,16 @@ func TestParseScanResponse_ColonInPath(t *testing.T) {
 	// Validates that the parser correctly handles colons in the path
 	// by using the LAST ": " as the delimiter
 	input := "1: /scandir/weird:path/file.pdf: OK"
-	result := parseScanResponse(input)
+	result, err := parseScanResponse(input)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
 	if result != "OK" {
 		t.Errorf("expected OK, got %q", result)
 	}
 }
+
+// ─── ScanFile integration tests (net.Pipe) ─────────────────────────────────────
 
 // TestScanFile_FileNotFound validates that ScanFile correctly returns
 // ErrFileNotFound when clamd reports "File path check failure: No such file
@@ -214,6 +271,101 @@ func TestScanFile_ScanError(t *testing.T) {
 	}
 	if finding != "" {
 		t.Errorf("expected empty finding on ErrClamdScanError, got %q", finding)
+	}
+}
+
+// ─── ScanStream tests (net.Pipe) ───────────────────────────────────────────────
+
+// stubInstreamServer reads the INSTREAM command + all chunks from the client,
+// then writes the given response line.
+func stubInstreamServer(t *testing.T, serverConn net.Conn, response string) {
+	t.Helper()
+	go func() {
+		defer serverConn.Close()
+		reader := bufio.NewReader(serverConn)
+		// Read the "nINSTREAM\n" command line.
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			return
+		}
+		// Drain all chunks until the zero-length terminator.
+		for {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
+				return
+			}
+			chunkLen := binary.BigEndian.Uint32(lenBuf[:])
+			if chunkLen == 0 {
+				break
+			}
+			chunk := make([]byte, chunkLen)
+			if _, err := io.ReadFull(reader, chunk); err != nil {
+				return
+			}
+		}
+		_, _ = serverConn.Write([]byte(response + "\n"))
+	}()
+}
+
+func TestScanStream_Clean(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	stubInstreamServer(t, serverConn, "stream: OK")
+
+	client := &ClamClient{
+		connection: clientConn,
+		reader:     bufio.NewReader(clientConn),
+	}
+	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	content := bytes.NewReader([]byte("clean file content"))
+	finding, err := client.ScanStream(content)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if finding != "OK" {
+		t.Errorf("expected OK, got %q", finding)
+	}
+}
+
+func TestScanStream_Infected(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	stubInstreamServer(t, serverConn, "stream: Win.Test.EICAR_HDB-1 FOUND")
+
+	client := &ClamClient{
+		connection: clientConn,
+		reader:     bufio.NewReader(clientConn),
+	}
+	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	content := bytes.NewReader([]byte("X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"))
+	finding, err := client.ScanStream(content)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if finding != "Win.Test.EICAR_HDB-1" {
+		t.Errorf("expected malware name, got %q", finding)
+	}
+}
+
+func TestScanStream_Error(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	stubInstreamServer(t, serverConn, "stream: Size limit reached. ERROR")
+
+	client := &ClamClient{
+		connection: clientConn,
+		reader:     bufio.NewReader(clientConn),
+	}
+	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	content := bytes.NewReader([]byte("some content"))
+	_, err := client.ScanStream(content)
+	if !errors.Is(err, ErrClamdScanError) {
+		t.Fatalf("expected ErrClamdScanError, got %v", err)
 	}
 }
 

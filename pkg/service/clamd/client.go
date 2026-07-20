@@ -6,6 +6,7 @@ package clamd
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -22,6 +23,11 @@ const clamdDialTimeout = 10 * time.Second
 // clamdIOTimeout is the deadline applied to the clamd connection at connect time.
 // This allows sufficient time for large file scans without timing out mid-operation.
 const clamdIOTimeout = 10 * time.Minute
+
+// clamdMaxSingleLineBytes is the maximum size of a single-line response from clamd.
+// Protects against unbounded single-line responses (F-12).
+// A typical clamd response is at most a few hundred bytes; 64 KB is generous.
+const clamdMaxSingleLineBytes = 64 * 1024
 
 // clamdMaxMultiLineBytes is the maximum size of a multi-line response from clamd.
 // Protects against unbounded responses.
@@ -109,18 +115,26 @@ func (client *ClamClient) sendCommand(command model.ClamDCommand) error {
 }
 
 // read reads a single newline-terminated response line from clamd.
-// Used for single-line commands (PING, VERSION, SCAN).
+// Used for single-line commands (PING, VERSION, SCAN, INSTREAM).
+// The response is capped at clamdMaxSingleLineBytes to prevent unbounded reads (F-12).
 func (client *ClamClient) read() (response []byte, err error) {
-	response, err = client.reader.ReadBytes('\n')
-	if err != nil {
+	// Use a LimitedReader to cap the total bytes read for this line.
+	limited := io.LimitReader(client.reader, clamdMaxSingleLineBytes)
+	limitedBuf := bufio.NewReader(limited)
+	response, err = limitedBuf.ReadBytes('\n')
+	if err != nil && len(response) == 0 {
 		return nil, err
+	}
+	// If we hit the limit without a newline, that is a protocol violation.
+	if len(response) >= clamdMaxSingleLineBytes {
+		return response, fmt.Errorf("clamd single-line response exceeded %d bytes", clamdMaxSingleLineBytes)
 	}
 
 	log.Debug().
 		Int("received", len(response)).
 		Msg("response received")
 
-	return
+	return response, nil
 }
 
 // readMultiLine reads clamd responses that span multiple newline-terminated lines

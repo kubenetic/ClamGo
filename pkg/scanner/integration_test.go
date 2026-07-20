@@ -757,7 +757,7 @@ func TestRedis_CachesLocally_AfterRedisHit(t *testing.T) {
 
 	// Verify it's now cached in memory
 	s.cancelMu.RLock()
-	_, inMem := s.cancelled[caseId]
+	_, inMem := s.cancelledCurrent[caseId]
 	s.cancelMu.RUnlock()
 	assert.True(t, inMem, "case should be cached in memory after Redis hit")
 
@@ -922,7 +922,7 @@ func TestCombined_CancelViaRedis_SkipsScan(t *testing.T) {
 
 	// Verify the case is now cached in memory too
 	s.cancelMu.RLock()
-	_, inMem := s.cancelled[caseId]
+	_, inMem := s.cancelledCurrent[caseId]
 	s.cancelMu.RUnlock()
 	assert.True(t, inMem, "Redis-cancelled case should be cached in memory after detection")
 
