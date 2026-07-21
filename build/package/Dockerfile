@@ -1,20 +1,6 @@
 # Multi-stage build for ClamGo
-#
-# BUILD CONTEXT: the parent uploader/ directory, NOT ClamGo/ itself.
-# The go.mod replace directive points to ../BunnyShepherd, so both modules
-# must be present inside the build context.
-#
-# Required command (run from the uploader/ directory):
-#   docker build \
-#     -f ClamGo/build/package/Dockerfile \
-#     --build-arg VERSION=<ver> \
-#     --build-arg BUILD_TIME=<ts> \
-#     -t clamgo:<tag> \
-#     .
-#
-# In CI (Jenkins / banyaDockerBuild), set:
-#   dockerfilePath: 'ClamGo/build/package/Dockerfile'
-#   buildContext:   '.'   (i.e. the uploader/ checkout root)
+# Build context is the repo root. Run from repo root:
+#   docker build -f build/package/Dockerfile .
 
 # Stage 1: Build
 FROM golang:1.25-alpine AS builder
@@ -29,16 +15,14 @@ RUN apk add --no-cache ca-certificates tzdata
 # Set working directory
 WORKDIR /build
 
-# Copy both modules so the replace directive resolves inside the container.
-COPY BunnyShepherd/ ./BunnyShepherd/
-COPY ClamGo/go.mod ClamGo/go.sum ./ClamGo/
+# Copy go mod files
+COPY go.mod go.sum ./
 
-# Download ClamGo dependencies (BunnyShepherd is local — no network needed for it).
-WORKDIR /build/ClamGo
+# Download dependencies
 RUN go mod download
 
-# Copy ClamGo source
-COPY ClamGo/ ./
+# Copy source code
+COPY . .
 
 # Build the application
 RUN CGO_ENABLED=0 GOOS=linux go build \
@@ -62,10 +46,10 @@ RUN addgroup -g 1000 clamgo && adduser -D -u 1000 -G clamgo clamgo
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /build/ClamGo/clamgo .
+COPY --from=builder /build/clamgo .
 
 # Copy config files
-COPY --chown=clamgo:clamgo ClamGo/configs/ ./configs/
+COPY --chown=clamgo:clamgo configs/ ./configs/
 
 # Create necessary directories with proper permissions
 RUN mkdir -p /app/data && chown -R clamgo:clamgo /app
