@@ -14,10 +14,6 @@ require (
 	github.com/testcontainers/testcontainers-go v0.39.0
 )
 
-// Use the local working-tree BunnyShepherd so ClamGo picks up the
-// countXDeathHeaders fix (C-3) before a new tag is published.
-replace github.com/kubenetic/BunnyShepherd => ../BunnyShepherd
-
 require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
