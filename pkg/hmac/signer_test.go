@@ -195,3 +195,69 @@ func TestKnownAnswer_CrossLanguageHMAC(t *testing.T) {
 	gotSig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 	assert.Equal(t, expectedSigB64, gotSig, "HMAC over exact payload bytes must match expected tag")
 }
+
+// TestSigner_SignsEveryScanResultEventType guards a defect found in DEV: only the scan
+// verdict was signed, while the scan-started and scan-retrying events published to the
+// same q.scan.results queue went out unsigned. With SCAN_HMAC_ENFORCE=true the backend
+// then silently discarded exactly one message per scan (no DLX on that queue), losing the
+// SCANNING progress event and retry notifications.
+//
+// Signing only the verdict is also not a safe half-measure: the Java consumer dispatches on
+// the __TypeId__ header, not the routing key, so exempting started/retrying from
+// verification would let an attacker publish a FileScanCompletedMessage under the
+// file.scan.started routing key and have a forged CLEAN verdict accepted unverified.
+//
+// Every payload type routed to q.scan.results must therefore sign and verify cleanly.
+func TestSigner_SignsEveryScanResultEventType(t *testing.T) {
+	signer, err := NewSigner(testKey, KeyIDV1)
+	require.NoError(t, err)
+
+	// Shapes mirror model.ScanCompletedMessage / ScanStartedMessage / ScanRetryingMessage.
+	cases := map[string]any{
+		"scan.completed": struct {
+			MessageId string    `json:"messageId"`
+			FileId    string    `json:"fileId"`
+			CaseId    string    `json:"caseId"`
+			Verdict   string    `json:"verdict"`
+			ScannedAt time.Time `json:"scannedAt"`
+		}{"m-1", "f-1", "c-1", "CLEAN", time.Date(2026, 7, 31, 19, 0, 0, 0, time.UTC)},
+
+		"scan.started": struct {
+			MessageId    string    `json:"messageId"`
+			FileId       string    `json:"fileId"`
+			CaseId       string    `json:"caseId"`
+			OriginalName string    `json:"originalName"`
+			SizeBytes    int64     `json:"sizeBytes"`
+			StartedAt    time.Time `json:"startedAt"`
+		}{"m-2", "f-1", "c-1", "doc.pdf", 1234, time.Date(2026, 7, 31, 19, 0, 1, 0, time.UTC)},
+
+		"scan.retrying": struct {
+			MessageId        string    `json:"messageId"`
+			FileId           string    `json:"fileId"`
+			CaseId           string    `json:"caseId"`
+			RetryCount       int       `json:"retryCount"`
+			MaxRetries       int       `json:"maxRetries"`
+			Error            string    `json:"error"`
+			NextRetryDelayMs int64     `json:"nextRetryDelayMs"`
+			FailedAt         time.Time `json:"failedAt"`
+		}{"m-3", "f-1", "c-1", 1, 3, "CLAMD_UNAVAILABLE", 5000, time.Date(2026, 7, 31, 19, 0, 2, 0, time.UTC)},
+	}
+
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			env, err := signer.Sign(payload)
+			require.NoError(t, err, "every q.scan.results payload type must be signable")
+			require.NotNil(t, env)
+
+			assert.Equal(t, KeyIDV1, env.Sig.KeyID)
+			assert.NotEmpty(t, env.Sig.Value, "signature must be present")
+			assert.NotEmpty(t, env.Sig.Nonce, "nonce must be present for replay protection")
+
+			require.NoError(t, Verify(testKey, env), "signature must verify with the same key")
+
+			// A different key must not verify — guards against a no-op signature.
+			otherKey := []byte("abcdefghijabcdefghijabcdefghij12")
+			require.Error(t, Verify(otherKey, env))
+		})
+	}
+}

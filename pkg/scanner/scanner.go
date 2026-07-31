@@ -6,6 +6,10 @@
 //   - Post-scan cancellation check
 //   - Result publication (file.scan.completed), optionally HMAC-signed
 //   - Retry routing (file.scan.retrying → retry queues; file.scan.failed → DLQ)
+//
+// Every message routed to q.scan.results — file.scan.completed, file.scan.started and
+// file.scan.retrying — is published through publishToExchange and is therefore signed
+// whenever a Signer is configured. See that function for why partial signing is unsafe.
 package scanner
 
 import (
@@ -571,12 +575,11 @@ func (s *Scanner) runScan(ctx context.Context, d amqp.Delivery, msg model.FileUp
 			SizeBytes:    msg.SizeBytes,
 			StartedAt:    time.Now().UTC(),
 		}
-		startedEnvelope := &mqmodel.JSONMessage[model.ScanStartedMessage]{
-			Payload: startedMsg,
-			Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanStarted},
-		}
 		pubCtx, pubCancel := publishCtx(ctx, 15*time.Second)
-		if err := s.pub.Publish(pubCtx, s.cfg.Exchange, s.cfg.ScanStartedRoutingKey, false, startedEnvelope); err != nil {
+		// Signed like the verdict: this lands on q.scan.results, which the backend
+		// verifies as a whole (see publishToExchange).
+		if err := s.publishToExchange(pubCtx, s.cfg.ScanStartedRoutingKey,
+			model.TypeIdFileScanStarted, startedMsg); err != nil {
 			log.Warn().Err(err).Msg("failed to publish ScanStartedMessage (non-fatal)")
 		}
 		pubCancel()
@@ -762,14 +765,12 @@ func (s *Scanner) handleScanFailure(
 			NextRetryDelayMs: delayMs,
 			FailedAt:         time.Now().UTC(),
 		}
-		notifEnvelope := &mqmodel.JSONMessage[model.ScanRetryingMessage]{
-			Payload: retryNotif,
-			Headers: amqp.Table{"__TypeId__": model.TypeIdFileScanRetrying},
-		}
 		// Best effort: log but don't fail if this publish doesn't confirm.
 		// Uses its own timeout so a slow retry publish cannot starve this one.
+		// Signed like the verdict: this lands on q.scan.results (see publishToExchange).
 		notifPubCtx, notifPubCancel := publishCtx(ctx, 15*time.Second)
-		if err := s.pub.Publish(notifPubCtx, s.cfg.Exchange, s.cfg.ScanRetryingRoutingKey, false, notifEnvelope); err != nil {
+		if err := s.publishToExchange(notifPubCtx, s.cfg.ScanRetryingRoutingKey,
+			model.TypeIdFileScanRetrying, retryNotif); err != nil {
 			log.Warn().Err(err).Str("fileId", msg.FileId).Msg("failed to publish ScanRetryingMessage (non-fatal)")
 		}
 		notifPubCancel()
@@ -834,15 +835,31 @@ dlqPath:
 // The bytes placed in SignedEnvelope.Payload are the EXACT bytes that were
 // HMAC-signed — no re-serialisation occurs between signing and publishing.
 func (s *Scanner) publishScanCompleted(ctx context.Context, result model.ScanCompletedMessage) error {
-	headers := amqp.Table{"__TypeId__": model.TypeIdFileScanCompleted}
+	return s.publishToExchange(ctx, s.cfg.ScanCompletedRoutingKey, model.TypeIdFileScanCompleted, result)
+}
+
+// publishToExchange publishes payload to the configured exchange, signing it when a
+// Signer is configured.
+//
+// EVERY message routed to q.scan.results must go through here. That queue is bound to
+// file.scan.completed, file.scan.started AND file.scan.retrying, and the Java consumer
+// dispatches on the __TypeId__ header rather than the routing key. If only the verdict
+// were signed, the backend could not enforce signatures without either dropping the
+// started/retrying events or opening a bypass: an attacker could publish a
+// FileScanCompletedMessage under the file.scan.started routing key and have a forged
+// CLEAN verdict accepted unverified.
+//
+// The bytes placed in SignedEnvelope.Payload are the EXACT bytes that were HMAC-signed —
+// no re-serialisation happens between signing and publishing. The __TypeId__ header is
+// always set so the Java backend dispatches correctly whether or not the body is signed.
+func (s *Scanner) publishToExchange(ctx context.Context, routingKey, typeId string, payload any) error {
+	headers := amqp.Table{"__TypeId__": typeId}
 
 	if s.signer != nil {
-		env, err := s.signer.Sign(result)
+		env, err := s.signer.Sign(payload)
 		if err != nil {
 			return fmt.Errorf("HMAC sign: %w", err)
 		}
-		// Publish the SignedEnvelope as the message body.
-		// The payload field contains the exact canonical bytes that were signed.
 		envBytes, err := json.Marshal(env)
 		if err != nil {
 			return fmt.Errorf("marshal SignedEnvelope: %w", err)
@@ -851,15 +868,15 @@ func (s *Scanner) publishScanCompleted(ctx context.Context, result model.ScanCom
 			Payload: json.RawMessage(envBytes),
 			Headers: headers,
 		}
-		return s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, rawEnvelope)
+		return s.pub.Publish(ctx, s.cfg.Exchange, routingKey, false, rawEnvelope)
 	}
 
 	// Unsigned path (SBX / no key configured).
-	envelope := &mqmodel.JSONMessage[model.ScanCompletedMessage]{
-		Payload: result,
+	envelope := &mqmodel.JSONMessage[any]{
+		Payload: payload,
 		Headers: headers,
 	}
-	return s.pub.Publish(ctx, s.cfg.Exchange, s.cfg.ScanCompletedRoutingKey, false, envelope)
+	return s.pub.Publish(ctx, s.cfg.Exchange, routingKey, false, envelope)
 }
 
 // newClamdClient creates a new ClamClient connection using the configured protocol.
